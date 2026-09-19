@@ -335,7 +335,15 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "login"; success: true; data: { providerId: string } }
 
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
-	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
+	| {
+			id?: string;
+			type: "response";
+			command: string;
+			success: false;
+			error: string;
+			code?: string;
+			details?: object;
+	  };
 
 // ============================================================================
 // Subagent Events (stdout)

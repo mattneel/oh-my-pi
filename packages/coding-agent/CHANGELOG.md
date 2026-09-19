@@ -6,6 +6,10 @@
 
 - Removed support for the env parameter in the bash tool
 
+### Added
+
+- Added `omp attach` for authenticated same-user local takeover of live interactive and RPC sessions, with exclusive epoch-fenced control, safe-boundary handoff, reconnect grace, bounded output, terminal restoration, and automatic resumption of a displaced original frontend ([#8404](https://github.com/can1357/oh-my-pi/issues/8404)).
+
 ### Fixed
 
 - Fixed resume clutter: elide 0-turn sessions from the /resume menu; -c similarly skips empty sessions.
