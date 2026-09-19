@@ -86,6 +86,8 @@ export interface InteractiveModeInitOptions {
 	autoStartCollab?: boolean;
 	/** Recent-session rows loaded by the prepaint composer while runtime modules initialized. */
 	recentSessions?: Promise<RecentSession[] | undefined>;
+	/** Build a render/input view without initializing extension UI a second time. */
+	skipExtensionInitialization?: boolean;
 }
 
 export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions & Pick<HookSelectorOptions, "disabledIndices">;

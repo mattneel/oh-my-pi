@@ -117,6 +117,7 @@ type RunRpcMode = (
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	subagentEventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
+	hostMode?: "rpc" | "rpc-ui",
 ) => Promise<never>;
 
 /** Interactive-only graph boundary; login dialogs and overlays load on first real use. */
@@ -149,7 +150,7 @@ async function loadSessionPicker(): Promise<SessionPicker> {
 				await storage.deleteSessionWithArtifacts(session.path);
 				return true;
 			},
-			loadAllSessions: () => SessionManager.listAll(storage),
+			loadAllSessions: () => SessionManager.listAllForPicker(storage),
 		});
 	};
 }
@@ -660,6 +661,13 @@ async function runInteractiveMode(
 		await logger.time("InteractiveMode.renderInitialMessages", () =>
 			mode.renderInitialMessages({ preserveExistingChat: true }),
 		);
+		// Publishing the attach endpoint is additive: never let a locked-down runtime directory or an
+		// exhausted socket path budget stop an otherwise healthy interactive session from starting.
+		if (process.platform !== "win32") {
+			await mode.startLiveAttachHost("interactive").catch(error => {
+				logger.warn("Live terminal attachment unavailable for this session", { error: String(error) });
+			});
+		}
 		// A resolved version check must not insert its banner into a partial transcript.
 		checkedVersionPromise.then(newVersion => {
 			if (!settings.get("startup.checkUpdate")) {
@@ -1973,8 +1981,8 @@ export async function runRootCommand(
 		// resolved) rejects a native --resume, so the picker must not run first.
 		if (parsedArgs.resume === true && !parsedArgs.fork && !parsedArgs.noSession) {
 			const folderSessions = await logger.time(
-				"SessionManager.list",
-				SessionManager.list,
+				"SessionManager.listForPicker",
+				SessionManager.listForPicker,
 				cwd,
 				parsedArgs.sessionDir,
 			);
@@ -1985,7 +1993,10 @@ export async function runRootCommand(
 				// silently surfaced other projects' history when the cwd was empty
 				// (issue #3099). The preloaded list also makes the user's Tab switch
 				// instant on the way in.
-				preloadedAllSessions = await logger.time("SessionManager.listAll", SessionManager.listAll);
+				preloadedAllSessions = await logger.time(
+					"SessionManager.listAllForPicker",
+					SessionManager.listAllForPicker,
+				);
 				if (preloadedAllSessions.length === 0) {
 					writeStartupNotice(parsedArgs, `${chalk.dim("No sessions found")}\n`);
 					stopStartupWatchdog();
@@ -2289,7 +2300,13 @@ export async function runRootCommand(
 				// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
 				const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 				stopStartupWatchdog();
-				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, subagentEventBus, rpcInput);
+				await runRpcMode(
+					session,
+					mode === "rpc-ui" ? setToolUIContext : undefined,
+					subagentEventBus,
+					rpcInput,
+					mode === "rpc-ui" ? "rpc-ui" : "rpc",
+				);
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 				const startupChangelog = await startupChangelogPromise;

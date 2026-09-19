@@ -30,6 +30,7 @@ import {
 	getPaddingX,
 	Loader,
 	Markdown,
+	ProcessTerminal,
 	Spacer,
 	setTerminalTextSizing,
 	setTuiTight,
@@ -39,7 +40,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
-import type { TerminalAppearanceRequestToken } from "@oh-my-pi/pi-tui/terminal";
+import type { Terminal, TerminalAppearanceRequestToken } from "@oh-my-pi/pi-tui/terminal";
 import { isInsideTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import {
 	$env,
@@ -56,6 +57,8 @@ import {
 	setProjectDir,
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { LiveAttachHost } from "../attach/host";
+import { SwitchableTerminal } from "../attach/terminal";
 import { reset as resetCapabilities } from "../capability";
 import { restartArgv } from "../cli/flag-tables";
 import type { CollabGuestLink } from "../collab/guest";
@@ -1121,6 +1124,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#mcpConnectedServers = new Set<string>();
 	#mcpFailedServers = new Map<string, { error: string; sourcePath?: string }>();
 	readonly #chatHost: ChatBlockHost = { requestRender: () => this.ui.requestRender() };
+	readonly #attachTerminal: SwitchableTerminal;
+	#liveAttachHost: LiveAttachHost | undefined;
 
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
 	get subagentEventBus(): EventBus | undefined {
@@ -1137,6 +1142,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		eventBus?: EventBus,
 		composer?: Composer,
 		subagentEventBus?: EventBus,
+		terminal?: Terminal,
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
@@ -1154,10 +1160,19 @@ export class InteractiveMode implements InteractiveModeContext {
 			spellingAutocorrect: settings.get("spelling.autocorrect"),
 		};
 		const wasStarted = composer?.started ?? false;
+		// A cold-start composer already owns the switchable terminal it was built on; a warm-start or
+		// RPC construction wraps the supplied (or a fresh) terminal so live attachment can swap the
+		// active frontend without rebuilding the TUI.
+		const suppliedTerminal = terminal ?? composer?.ui.terminal;
+		this.#attachTerminal =
+			suppliedTerminal instanceof SwitchableTerminal
+				? suppliedTerminal
+				: new SwitchableTerminal(suppliedTerminal ?? new ProcessTerminal());
 		this.composer =
 			composer ??
 			new Composer({
 				preferences,
+				terminal: this.#attachTerminal,
 				welcome: {
 					version,
 					modelName: session.model?.name ?? "Unknown",
@@ -1171,6 +1186,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			});
 		this.composer.setPreferences(preferences);
 		this.ui = this.composer.ui;
+		this.#attachTerminal.setRedrawRequester(() => {
+			this.ui.invalidate();
+			this.ui.requestRender(true, { clearScrollback: true });
+		});
 		this.editor = this.composer.editor;
 		this.editor.magicKeywordsEnabled = () => this.settings.get("magicKeywords.enabled");
 		this.editor.imageReferenceHyperlink = imageReferenceHyperlink;
@@ -1645,7 +1664,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (options.autoStartCollab === true) this.collabController.autoStart();
 
 		// Initialize hooks with TUI-based UI context
-		await logger.time("InteractiveMode.init:hooks", () => this.initHooksAndCustomTools());
+		if (!options.skipExtensionInitialization) {
+			await logger.time("InteractiveMode.init:hooks", () => this.initHooksAndCustomTools());
+		}
 
 		// Restore mode from session (e.g. plan mode on resume)
 		this.session.setSessionBeforeSwitchReconciler?.(async () => {
@@ -5464,6 +5485,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	stop(): void {
+		void this.#liveAttachHost?.close();
+		this.#liveAttachHost = undefined;
 		this.#appearanceRefreshRequest = undefined;
 		this.#streamPublisher?.dispose();
 		this.#streamPublisher = undefined;
@@ -5517,6 +5540,19 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#ownsStartedUi = false;
 		}
 		this.isInitialized = false;
+	}
+
+	async startLiveAttachHost(hostMode: "interactive" | "rpc" | "rpc-ui"): Promise<LiveAttachHost> {
+		if (this.#liveAttachHost) return this.#liveAttachHost;
+		const host = new LiveAttachHost({
+			session: this.session,
+			terminal: this.#attachTerminal,
+			hostMode,
+			project: this.sessionManager.getCwd(),
+		});
+		await host.start();
+		this.#liveAttachHost = host;
+		return host;
 	}
 
 	async shutdown(): Promise<void> {
