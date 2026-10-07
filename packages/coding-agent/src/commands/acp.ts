@@ -13,13 +13,14 @@ import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
 
 export default class Acp extends Command {
 	static description = commandHelp.description;
+	static flags = commandHelp.flags;
 	static strict = false;
 
 	async run(): Promise<void> {
 		const { args, terminalAuth } = prepareAcpTerminalAuthArgs(this.argv);
 		let parsed: ParsedArgs;
 		try {
-			parsed = parseArgs(args);
+			parsed = parseArgs(args, undefined, { processMode: terminalAuth ? undefined : "acp" });
 		} catch (error) {
 			if (reportCliUsageError(error)) {
 				process.exitCode = 2;
@@ -30,6 +31,11 @@ export default class Acp extends Command {
 		if (!terminalAuth) {
 			parsed.mode = "acp";
 		}
-		await runRootCommand(parsed, args);
+		try {
+			await runRootCommand(parsed, args);
+		} catch (error) {
+			if (reportCliUsageError(error)) process.exit(2);
+			throw error;
+		}
 	}
 }

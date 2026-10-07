@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Native integrations can adopt Unix full-duplex descriptors with cancellation-safe reads, writes, and teardown.
+
 ## [18.15.0] - 2026-11-01
 
 ### Fixed

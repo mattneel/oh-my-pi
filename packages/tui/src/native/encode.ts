@@ -231,6 +231,13 @@ function decodeEvent(value: Record<string, unknown>): TspEvent | null {
 	return value as TspEvent;
 }
 
+/** Optional budgets for a presentation peer whose input shares a longer-lived control process. */
+export interface TspReaderLimits {
+	readonly maxMessageBytes: number;
+	readonly maxPendingBytes: number;
+	readonly maxPendingMessages: number;
+}
+
 /**
  * Reassembles chunked terminal → program messages and decodes replies and
  * events. Unknown verbs, unknown events and unknown fields are tolerated
@@ -238,6 +245,19 @@ function decodeEvent(value: Record<string, unknown>): TspEvent | null {
  */
 export class TspReader {
 	#chunks = new Map<string, string>();
+	#chunkSizes: Map<string, { bodyBytes: number; idBytes: number }> | undefined;
+	#pendingBytes = 0;
+
+	constructor(private readonly limits?: TspReaderLimits) {
+		if (limits) this.#chunkSizes = new Map();
+	}
+
+	/** Release incomplete messages when their presentation connection ends. */
+	clear(): void {
+		this.#chunks.clear();
+		this.#chunkSizes?.clear();
+		this.#pendingBytes = 0;
+	}
 
 	/** Feed one complete APC string. Returns the decoded message once complete, else null. */
 	feed(sequence: string): TspIncoming | null {
@@ -245,6 +265,32 @@ export class TspReader {
 		if (!raw) return null;
 		let body = raw.body;
 		const chunkId = raw.params.c;
+		if (this.limits) {
+			const bodyBytes = Buffer.byteLength(body);
+			const previous = chunkId === undefined ? undefined : this.#chunkSizes?.get(chunkId);
+			if ((previous?.bodyBytes ?? 0) + bodyBytes > this.limits.maxMessageBytes) {
+				this.clear();
+				throw new RangeError("TSP input exceeds the message byte limit");
+			}
+			if (chunkId !== undefined && raw.params.m === "1") {
+				const idBytes = previous?.idBytes ?? Buffer.byteLength(chunkId);
+				const addedBytes = bodyBytes + (previous ? 0 : idBytes);
+				if (this.#pendingBytes + addedBytes > this.limits.maxPendingBytes) {
+					this.clear();
+					throw new RangeError("TSP input exceeds the pending reassembly byte limit");
+				}
+				if (!previous && this.#chunks.size >= this.limits.maxPendingMessages) {
+					this.clear();
+					throw new RangeError("TSP input exceeds the pending message count limit");
+				}
+				this.#pendingBytes += addedBytes;
+				if (previous) previous.bodyBytes += bodyBytes;
+				else this.#chunkSizes?.set(chunkId, { bodyBytes, idBytes });
+			} else if (chunkId !== undefined && previous) {
+				this.#pendingBytes -= previous.bodyBytes + previous.idBytes;
+				this.#chunkSizes?.delete(chunkId);
+			}
+		}
 		if (chunkId !== undefined) {
 			const joined = (this.#chunks.get(chunkId) ?? "") + body;
 			if (raw.params.m === "1") {

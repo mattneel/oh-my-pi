@@ -169,6 +169,35 @@ describe("TSP framing", () => {
 		});
 	});
 
+	it("bounds UTF-8 message bytes before joining chunks and releases rejected prefixes", () => {
+		const reader = new TspReader({ maxMessageBytes: 32, maxPendingBytes: 128, maxPendingMessages: 4 });
+		reader.feed(encodeTspMessage("e", "é".repeat(16), { c: "a", m: "1" }));
+		expect(() => reader.feed(encodeTspMessage("e", "é", { c: "a" }))).toThrow("message byte limit");
+		const event: TspEvent = { ev: "ack", sf: "s:1", s: 1 };
+		expect(reader.feed(encodeTspMessage("e", JSON.stringify(event), { c: "a" }))).toEqual({
+			verb: "e",
+			event,
+		});
+	});
+
+	it("bounds aggregate prefixes, chunk identifiers and outstanding message count", () => {
+		for (const fixture of [
+			{ limit: 4, prefix: "1234567", nextId: "b", error: "pending reassembly byte limit" },
+			{ limit: 4, prefix: "", nextId: "long-identifier", error: "pending reassembly byte limit" },
+			{ limit: 1, prefix: "", nextId: "b", error: "pending message count limit" },
+		]) {
+			const reader = new TspReader({
+				maxMessageBytes: 128,
+				maxPendingBytes: 8,
+				maxPendingMessages: fixture.limit,
+			});
+			reader.feed(encodeTspMessage("e", fixture.prefix, { c: "a", m: "1" }));
+			expect(() => reader.feed(encodeTspMessage("e", "x", { c: fixture.nextId, m: "1" }))).toThrow(fixture.error);
+			const event: TspEvent = { ev: "ack", sf: "s:1", s: 2 };
+			expect(reader.feed(encodeTspMessage("e", JSON.stringify(event), { c: "a" }))).toEqual({ verb: "e", event });
+		}
+	});
+
 	it("decodes prefs change events whatever their value", () => {
 		for (const value of [true, 50, "branch", ["c", "a"], null]) {
 			const event = { ev: "change", sf: "s:1", id: "pf", item: "task.isolation.merge", value };

@@ -1,23 +1,18 @@
 /**
- * Builds transcript components from persisted session message entries — the
- * file/remote-backed counterpart to {@link UiHelpers.addMessageToChat} (which is
- * bound to the live InteractiveModeContext). Used by the fullscreen transcript
- * viewer ({@link AgentTranscriptViewer}) to render a parked subagent / advisor /
- * collab-guest transcript that has no live session.
- *
- * Unlike incremental transcript sync, {@link ChatTranscriptBuilder.rebuild}
- * always discards prior components and rebuilds the whole transcript from the
- * supplied entries. Re-rendering a growing transcript is therefore O(n) in the
- * entry count, but it cannot duplicate or misorder rows the way incremental
- * component reuse could.
+ * Shared semantic transcript components for recorded viewers and live consumers.
+ * Replay rebuilds once; cumulative assistant updates retain components and native ids.
+ * The host supplies display capabilities, not an interactive terminal or control path.
  */
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ToolCall, ToolResultMessage, Usage } from "@oh-my-pi/pi-ai";
 import { type Component, type TUI } from "../tui";
 import type { AdvisorMessageDetails } from "./messages";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "./messages";
-import { chatTranscriptDisplayPreferences as displayPreferences } from "./display-preferences";
-import type { MessageRenderer } from "./extension-types";
+import {
+	type ChatTranscriptDisplayPreferences,
+	chatTranscriptDisplayPreferences as displayPreferences,
+} from "./display-preferences";
+import type { AssistantThinkingRenderer, MessageRenderer } from "./extension-types";
 import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "./messages";
 import {
 	BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE,
@@ -64,29 +59,48 @@ import {
 	LateDiagnosticsMessageComponent,
 	routeLateDiagnostics,
 } from "./late-diagnostics-message";
-import { groupedReadUsageCallIds, ReadToolGroupComponent, readArgsCollapseIntoGroup } from "./read-tool-group";
+import {
+	groupedReadUsageCallIds,
+	ReadToolGroupComponent,
+	readArgsCollapseIntoGroup,
+	readArgsHaveTarget,
+} from "./read-tool-group";
 import { isReplyWrite, ReplyWriteComponent, replyDisplayMessage, toolResultReplies } from "./reply-write";
 import { SkillMessageComponent } from "./skill-message";
-import { ToolExecutionComponent, type ToolExecutionHandle } from "./tool-execution";
+import { ToolExecutionComponent, type ToolExecutionHandle, toolRenderName } from "./tool-execution";
+import { reconcileStreamedToolCallIds } from "./streamed-tool-call-ids";
 import { TranscriptContainer } from "../chrome/transcript-container";
 import { createUsageRowBlock, TurnUsageTally, turnElapsedMs } from "../overlays/usage-row";
 import { CollapsedSyntheticMessageComponent, UserMessageComponent } from "./user-message";
 
 export interface ChatTranscriptBuilderDeps {
-	ui: TUI;
+	ui: Pick<TUI, "requestRender" | "requestComponentRender" | "resetDisplay" | "imageBudget" | "lastFrameCostMs">;
 	getTool?: (name: string) => AgentTool | undefined;
 	/** Whether the active registry entry came from a built-in factory. */
 	isBuiltInTool?: (name: string) => boolean;
+	/** Decode in-flight arguments through the product's ordinary streamed-preview path. */
+	toolArgs?: (call: ToolCall, renderName: string) => Record<string, unknown>;
 	getMessageRenderer?: (customType: string) => MessageRenderer | undefined;
 	cwd: string;
 	hideThinkingBlock?: () => boolean;
 	proseOnlyThinking?: () => boolean;
 	expandThinkingBlocks?: () => boolean;
+	thinkingRenderers?: () => readonly AssistantThinkingRenderer[];
+	displayPreferences?: ChatTranscriptDisplayPreferences;
 	/** Session-scoped resolved destinations for model-authored Markdown links. */
 	linkTargets?: ReadonlyMap<string, string>;
 	/** Draw charts under numeric tables; false for transcripts that are not the main session's. Default: true. */
 	tableCharts?: boolean;
 	requestRender: () => void;
+}
+
+interface StreamingAssistant {
+	before: AssistantMessageComponent;
+	after: Map<string, AssistantMessageComponent>;
+	tools: Map<string, ToolExecutionHandle>;
+	seenTools: Set<string>;
+	idsByIndex: Map<number, string>;
+	hasVisibleContent: boolean;
 }
 
 export class ChatTranscriptBuilder {
@@ -109,12 +123,23 @@ export class ChatTranscriptBuilder {
 	#expandables: Array<{ setExpanded(expanded: boolean): void }> = [];
 	#expanded = false;
 	#entryComponents = new Map<string, Component[]>();
+	#streamingAssistant: StreamingAssistant | undefined;
+	#completedTools = new Set<string>();
+	#backgroundTools = new Set<string>();
+	#heldResults = new Map<string, { message: ToolResultMessage; partial: boolean }>();
+	#heldPreviews = new Map<string, unknown>();
+	/** Execution-created cards awaiting their first assistant tool-call snapshot. */
+	#unclaimedTools = new Map<string, ToolExecutionHandle>();
 
 	readonly #deps: ChatTranscriptBuilderDeps;
 
 	constructor(deps: ChatTranscriptBuilderDeps) {
 		this.#deps = deps;
-		this.container.setToolActivityVisible(!displayPreferences.hideToolActivity);
+		this.container.setToolActivityVisible(!this.#preferences.hideToolActivity);
+	}
+
+	get #preferences(): ChatTranscriptDisplayPreferences {
+		return this.#deps.displayPreferences ?? displayPreferences;
 	}
 
 	/** Whether the transcript currently holds any rendered rows. */
@@ -136,6 +161,108 @@ export class ChatTranscriptBuilder {
 	append(entries: TranscriptEntry[]): void {
 		for (const entry of entries) this.#appendEntry(entry);
 		if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
+	}
+
+	/** Append a live completed message using the same components as persisted replay. */
+	appendMessage(message: AgentMessage): void {
+		this.#appendChatMessage(message);
+		if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
+	}
+
+	/** Update the current assistant in place, retaining native node ids and local expansion. */
+	updateAssistant(message: AssistantMessage, transient = true): void {
+		// A parked background call must not delay the preceding request's metrics
+		// past the next assistant, whose final snapshot owns a new usage batch.
+		if (!this.#streamingAssistant) this.#flushPendingUsage();
+		this.#streamingAssistant = this.#renderAssistant(message, this.#streamingAssistant, transient);
+		if (!transient) {
+			this.#streamingAssistant = undefined;
+			if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
+		}
+	}
+
+	/** Seal the assistant and abandoned foreground calls at agent_end, leaving background tasks live. */
+	settleRun(): void {
+		if (this.#streamingAssistant) {
+			this.#streamingAssistant.before.markTranscriptBlockFinalized();
+			for (const component of this.#streamingAssistant.after.values()) component.markTranscriptBlockFinalized();
+			this.#streamingAssistant = undefined;
+		}
+		for (const id of this.#pendingTools.keys()) {
+			if (this.#backgroundTools.has(id)) continue;
+			this.#pendingTools.get(id)?.seal();
+			this.#pendingTools.delete(id);
+			this.#readArgs.delete(id);
+			this.#completedTools.add(id);
+		}
+		for (const id of this.#readArgs.keys()) this.#completedTools.add(id);
+		this.#readArgs.clear();
+		this.#heldResults.clear();
+		this.#heldPreviews.clear();
+		this.#unclaimedTools.clear();
+		this.#readGroup?.seal();
+		this.#flushPendingUsage();
+		this.#readGroup = null;
+	}
+
+	startToolExecution(id: string, name: string, args: Record<string, unknown>): void {
+		if (this.#completedTools.has(id)) return;
+		let component = this.#pendingTools.get(id);
+		if (!component) {
+			const groupedRead = name === "read" && (this.#readArgs.has(id) || readArgsCollapseIntoGroup(args));
+			if (groupedRead) {
+				component = this.#ensureReadGroup();
+			} else {
+				this.#readGroup?.finalize();
+				this.#readGroup = null;
+				component = this.#createTool(id, name, args);
+			}
+			this.#pendingTools.set(id, component);
+			if (!this.#streamingAssistant?.seenTools.has(id) && !this.#readArgs.has(id)) {
+				this.#unclaimedTools.set(id, component);
+			}
+		}
+		component.updateArgs(args, id);
+		component.setArgsComplete(id);
+		component.setExecutionStarted(id);
+		this.#consumeHeld(id);
+	}
+
+	updateToolResult(message: ToolResultMessage, partial = false): void {
+		if (this.#completedTools.has(message.toolCallId)) return;
+		const component = this.#pendingTools.get(message.toolCallId);
+		if (!component && !this.#readArgs.has(message.toolCallId)) {
+			this.#heldResults.set(message.toolCallId, { message, partial });
+			return;
+		}
+		const asyncState = (message.details as { async?: { state?: string } } | undefined)?.async?.state;
+		const terminalBackground =
+			this.#backgroundTools.has(message.toolCallId) && (asyncState === "completed" || asyncState === "failed");
+		if (partial && !terminalBackground) {
+			component?.updateResult(message, true, message.toolCallId);
+		} else {
+			this.#appendToolResult(terminalBackground ? { ...message, isError: asyncState === "failed" } : message);
+			if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
+		}
+	}
+
+	updateToolPreview(id: string, update: unknown): void {
+		const component = this.#pendingTools.get(id);
+		if (component instanceof ToolExecutionComponent) component.updateStreamPreview(update);
+		else if (!this.#completedTools.has(id)) this.#heldPreviews.set(id, update);
+	}
+
+	#consumeHeld(id: string): void {
+		const preview = this.#heldPreviews.get(id);
+		if (preview !== undefined) {
+			this.#heldPreviews.delete(id);
+			this.updateToolPreview(id, preview);
+		}
+		const result = this.#heldResults.get(id);
+		if (result) {
+			this.#heldResults.delete(id);
+			this.updateToolResult(result.message, result.partial);
+		}
 	}
 
 	/**
@@ -182,6 +309,12 @@ export class ChatTranscriptBuilder {
 		this.#todoSnapshot = null;
 		this.#expandables = [];
 		this.#entryComponents.clear();
+		this.#streamingAssistant = undefined;
+		this.#completedTools.clear();
+		this.#backgroundTools.clear();
+		this.#heldResults.clear();
+		this.#heldPreviews.clear();
+		this.#unclaimedTools.clear();
 		this.container.dispose();
 		this.container.clear();
 	}
@@ -206,8 +339,8 @@ export class ChatTranscriptBuilder {
 
 	/** Append assistant prose (a reply, a post-tool segment, or an `out://` reply write) with the transcript's display preferences. */
 	#mountProse(component: AssistantMessageComponent): void {
-		component.setImagesVisible(displayPreferences.showImages);
-		component.setToolResultImagesVisible(!displayPreferences.hideToolActivity);
+		component.setImagesVisible(this.#preferences.showImages);
+		component.setToolResultImagesVisible(!this.#preferences.hideToolActivity);
 		component.setTableChartsVisible(this.#deps.tableCharts !== false);
 		this.#trackExpandable(component);
 		this.container.addChild(component);
@@ -245,7 +378,7 @@ export class ChatTranscriptBuilder {
 	#ensureReadGroup(): ReadToolGroupComponent {
 		if (!this.#readGroup) {
 			this.#readGroup = new ReadToolGroupComponent({
-				showContentPreview: displayPreferences.readToolResultPreview,
+				showContentPreview: this.#preferences.readToolResultPreview,
 			});
 			this.#trackExpandable(this.#readGroup);
 			this.container.addChild(this.#readGroup);
@@ -270,7 +403,7 @@ export class ChatTranscriptBuilder {
 			) ??
 				false);
 		if (!usageAttached) {
-			this.#readGroup?.seal();
+			this.#readGroup?.finalize();
 			this.#readGroup = null;
 			this.container.addChild(
 				createUsageRowBlock(
@@ -293,12 +426,12 @@ export class ChatTranscriptBuilder {
 	#appendChatMessage(message: AgentMessage): void {
 		if (message.role !== "toolResult") this.#flushPendingUsage();
 		if (message.role !== "assistant" && message.role !== "toolResult") {
-			this.#readGroup?.seal();
+			this.#readGroup?.finalize();
 			this.#readGroup = null;
 		}
 		switch (message.role) {
 			case "assistant":
-				this.#appendAssistantMessage(message);
+				this.#renderAssistant(message);
 				break;
 			case "toolResult":
 				this.#appendToolResult(message);
@@ -357,7 +490,7 @@ export class ChatTranscriptBuilder {
 					truncation: message.meta?.truncation,
 					artifactError: message.meta?.artifactError,
 					images: message.images,
-					showImages: displayPreferences.showImages,
+					showImages: this.#preferences.showImages,
 				});
 				this.container.addChild(component);
 				break;
@@ -412,145 +545,304 @@ export class ChatTranscriptBuilder {
 		return turnElapsedMs(this.#turnStartedAt, message);
 	}
 
-	#appendAssistantMessage(message: Extract<AgentMessage, { role: "assistant" }>): void {
-		const hideThinkingBlock = this.#deps.hideThinkingBlock?.() ?? false;
-		const proseOnlyThinking = this.#deps.proseOnlyThinking ? this.#deps.proseOnlyThinking() : true;
-		const expandThinkingBlocks = this.#deps.expandThinkingBlocks?.() ?? false;
-		const timeline = splitAssistantMessageToolTimeline(message);
-		const assistantComponent = new AssistantMessageComponent(
-			timeline.beforeTools,
-			hideThinkingBlock,
+	#createAssistant(message: AssistantMessage): AssistantMessageComponent {
+		const component = new AssistantMessageComponent(
+			undefined,
+			this.#deps.hideThinkingBlock?.() ?? false,
 			() => this.#deps.requestRender(),
-			this.#deps.getMessageRenderer ? undefined : [], // placeholder for thinkingRenderers
+			this.#deps.thinkingRenderers?.(),
 			this.#deps.ui.imageBudget,
-			proseOnlyThinking,
+			this.#deps.proseOnlyThinking?.() ?? true,
 			this.#deps.linkTargets,
-			expandThinkingBlocks,
+			this.#deps.expandThinkingBlocks?.() ?? false,
 		);
-		assistantComponent.pickReactionTarget(this.container.children);
-		this.#mountProse(assistantComponent);
-		let lastAssistantComponent = assistantComponent;
+		component.pickReactionTarget(this.container.children);
+		component.updateContent(message);
+		this.#mountProse(component);
+		return component;
+	}
 
-		if (displayPreferences.cacheMissMarker) {
-			const invalidation = detectCacheInvalidation(this.#lastAssistantUsage, message.usage);
-			if (invalidation) assistantComponent.setCacheInvalidation(invalidation);
+	/** The block a tool call opens: a reply for a built-in `write` to a reply URL (`out://`), a tool card for anything else. */
+	#createTool(id: string, name: string, args: Record<string, unknown>): ToolExecutionHandle {
+		const tool = this.#deps.getTool?.(name);
+		const renderName = toolRenderName(name, tool);
+		const builtIn = this.#deps.isBuiltInTool?.(renderName) ?? true;
+		if (builtIn && isReplyWrite(renderName, args) === true) {
+			const reply = new ReplyWriteComponent({
+				requestRender: () => this.#deps.requestRender(),
+				imageBudget: this.#deps.ui.imageBudget,
+				linkTargets: this.#deps.linkTargets,
+			});
+			this.#mountProse(reply);
+			return reply;
 		}
-		if (message.usage.cacheRead + message.usage.cacheWrite + message.usage.input > 0) {
-			this.#lastAssistantUsage = message.usage;
-		}
-		assistantComponent.setServedModelMismatch(this.#servedModelTracker.check(message));
+		const component = new ToolExecutionComponent(
+			renderName,
+			args,
+			{
+				useBuiltInRenderer: builtIn,
+				showImages: this.#preferences.showImages,
+			},
+			tool,
+			this.#deps.ui,
+			this.#deps.cwd,
+			id,
+		);
+		this.#trackExpandable(component);
+		this.container.addChild(component);
+		return component;
+	}
 
-		const hasVisibleAssistantContent = assistantHasVisibleContent(message);
-		if (hasVisibleAssistantContent) {
-			// New visible turn content closes the current read run (mirrors rebuild).
-			this.#readGroup?.seal();
-			this.#readGroup = null;
+	#retractTool(id: string, state: StreamingAssistant): void {
+		const background = this.#backgroundTools.has(id);
+		const component = background ? undefined : (state.tools.get(id) ?? this.#pendingTools.get(id));
+		if (component instanceof ReadToolGroupComponent) {
+			if (component.removeEntry(id)) {
+				component.seal();
+				this.container.removeChild(component);
+				if (this.#readGroup === component) this.#readGroup = null;
+			}
+		} else if (component) {
+			component.seal();
+			this.container.removeChild(component);
 		}
+		if (component && !this.container.children.includes(component)) {
+			this.#expandables = this.#expandables.filter(candidate => candidate !== component);
+			component.dispose?.();
+		}
+		const segment = state.after.get(id);
+		if (segment) {
+			segment.markTranscriptBlockFinalized();
+			this.container.removeChild(segment);
+			if (!this.container.children.includes(segment)) {
+				this.#expandables = this.#expandables.filter(candidate => candidate !== segment);
+				segment.dispose();
+			}
+		}
+		state.tools.delete(id);
+		state.after.delete(id);
+		state.seenTools.delete(id);
+		if (background) return;
+		this.#pendingTools.delete(id);
+		this.#readArgs.delete(id);
+		this.#heldResults.delete(id);
+		this.#heldPreviews.delete(id);
+		this.#unclaimedTools.delete(id);
+		this.#completedTools.add(id);
+	}
 
-		const errorPresentation = resolveAssistantErrorPresentation(message);
-		const hasErrorStop = errorPresentation.kind === "full";
-		const errorMessage = hasErrorStop ? errorPresentation.text : null;
-		const appendAssistantSegment = (segment: Extract<AgentMessage, { role: "assistant" }> | undefined) => {
-			if (!segment || !assistantHasVisibleContent(segment)) return;
-			const component = new AssistantMessageComponent(
-				segment,
-				hideThinkingBlock,
-				() => this.#deps.requestRender(),
-				this.#deps.getMessageRenderer ? undefined : [],
-				undefined,
-				proseOnlyThinking,
-				this.#deps.linkTargets,
-				expandThinkingBlocks,
-			);
-			this.#mountProse(component);
-			lastAssistantComponent = component;
+	#renderAssistant(message: AssistantMessage, previous?: StreamingAssistant, transient = false): StreamingAssistant {
+		const timeline = splitAssistantMessageToolTimeline(message);
+		const state = previous ?? {
+			before: this.#createAssistant(timeline.beforeTools),
+			after: new Map<string, AssistantMessageComponent>(),
+			tools: new Map<string, ToolExecutionHandle>(),
+			seenTools: new Set<string>(),
+			idsByIndex: new Map<number, string>(),
+			hasVisibleContent: false,
 		};
-
-		for (const content of message.content) {
-			if (content.type !== "toolCall") continue;
-			this.#resolveWaitingPoll(content.name);
-
-			const afterToolSegment = timeline.afterToolCalls.get(content.id);
-			if (content.name === "read" && readArgsCollapseIntoGroup(content.arguments)) {
-				if (hasErrorStop && errorMessage) {
-					const group = this.#ensureReadGroup();
-					group.updateArgs(content.arguments, content.id);
-					group.updateResult(
-						{ content: [{ type: "text", text: errorMessage }], isError: true },
-						false,
-						content.id,
-					);
-				} else if (afterToolSegment) {
-					const group = this.#ensureReadGroup();
-					group.updateArgs(content.arguments, content.id);
-					this.#pendingTools.set(content.id, group);
-				} else {
-					const normalizedArgs = normalizeToolArgs(content.arguments);
-					this.#readArgs.set(content.id, normalizedArgs);
+		const finalCallIds = transient ? undefined : new Set<string>();
+		if (finalCallIds) {
+			for (const call of message.content) {
+				if (call.type === "toolCall") finalCallIds.add(call.id);
+			}
+		}
+		if (!transient && (message.stopReason === "aborted" || message.stopReason === "error")) {
+			// Cancellation filters incomplete calls, shifting content indices. Do not
+			// mistake a surviving sibling at a shifted index for an id migration.
+			for (const id of state.seenTools) {
+				if (!finalCallIds?.has(id)) {
+					this.#retractTool(id, state);
 				}
-				appendAssistantSegment(afterToolSegment);
+			}
+			state.idsByIndex.clear();
+		}
+		reconcileStreamedToolCallIds(message.content, state.idsByIndex, (oldId, newId) => {
+			const component = state.tools.get(oldId);
+			if (component && !state.tools.has(newId)) {
+				state.tools.delete(oldId);
+				state.tools.set(newId, component);
+				if (component instanceof ReadToolGroupComponent) component.renameEntry(oldId, newId);
+			}
+			const pending = this.#pendingTools.get(oldId);
+			if (pending && !this.#pendingTools.has(newId)) {
+				this.#pendingTools.delete(oldId);
+				this.#pendingTools.set(newId, pending);
+			}
+			const args = this.#readArgs.get(oldId);
+			if (args) {
+				this.#readArgs.delete(oldId);
+				this.#readArgs.set(newId, args);
+			}
+			const segment = state.after.get(oldId);
+			if (segment) {
+				state.after.delete(oldId);
+				state.after.set(newId, segment);
+			}
+			const preview = this.#heldPreviews.get(oldId);
+			if (preview !== undefined) {
+				this.#heldPreviews.delete(oldId);
+				this.#heldPreviews.set(newId, preview);
+			}
+			const result = this.#heldResults.get(oldId);
+			if (result) {
+				this.#heldResults.delete(oldId);
+				this.#heldResults.set(newId, { ...result, message: { ...result.message, toolCallId: newId } });
+			}
+			if (state.seenTools.delete(oldId)) state.seenTools.add(newId);
+			if (this.#completedTools.delete(oldId)) this.#completedTools.add(newId);
+			if (this.#backgroundTools.delete(oldId)) this.#backgroundTools.add(newId);
+		});
+		if (finalCallIds) {
+			for (const id of state.seenTools) {
+				if (!finalCallIds.has(id)) this.#retractTool(id, state);
+			}
+		}
+		if (!state.hasVisibleContent && assistantHasVisibleContent(message)) {
+			this.#readGroup?.finalize();
+			this.#readGroup = null;
+			state.hasVisibleContent = true;
+		}
+		const assistantComponent = state.before;
+		assistantComponent.updateContent(timeline.beforeTools, { transient });
+		let lastAssistantComponent = assistantComponent;
+		let timelineAnchor: Component = assistantComponent;
+		if (!previous && !transient) assistantComponent.setServedModelMismatch(this.#servedModelTracker.check(message));
+		const errorPresentation = resolveAssistantErrorPresentation(message);
+		const errorMessage = !transient && errorPresentation.kind === "full" ? errorPresentation.text : undefined;
+		for (const call of message.content) {
+			if (call.type !== "toolCall") continue;
+			const tool = this.#deps.getTool?.(call.name);
+			const renderName = toolRenderName(call.name, tool);
+			const args = this.#deps.toolArgs?.(call, renderName) ?? call.arguments;
+			const unclaimed = this.#unclaimedTools.get(call.id);
+			if (!state.seenTools.has(call.id)) {
+				// Provider ids identify calls within one assistant snapshot, not the
+				// whole session. A newly observed call owns its own completion.
+				if (!unclaimed && this.#completedTools.delete(call.id) && renderName === "read") {
+					this.#readGroup?.finalize();
+					this.#readGroup = null;
+				}
+				this.#resolveWaitingPoll(renderName);
+				state.seenTools.add(call.id);
+			}
+			const afterToolSegment = timeline.afterToolCalls.get(call.id);
+			let component = state.tools.get(call.id) ?? unclaimed ?? this.#pendingTools.get(call.id);
+			if (component && !state.tools.has(call.id)) {
+				state.tools.set(call.id, component);
+				this.#unclaimedTools.delete(call.id);
+				if (unclaimed) {
+					// The execution event may precede the leading assistant snapshot.
+					const children = this.container.children;
+					const beforeIndex = children.indexOf(state.before);
+					const toolIndex = children.indexOf(component);
+					if (toolIndex >= 0 && beforeIndex > toolIndex) {
+						children.splice(beforeIndex, 1);
+						children.splice(toolIndex, 0, state.before);
+					}
+				}
+			}
+			if (!component && renderName === "read" && transient && !readArgsHaveTarget(args)) {
+				this.#readArgs.set(call.id, normalizeToolArgs(args));
 				continue;
 			}
-
-			this.#readGroup?.seal();
-			this.#readGroup = null;
-			const builtIn = this.#deps.isBuiltInTool?.(content.name) ?? true;
-			let component: ToolExecutionHandle;
-			if (builtIn && isReplyWrite(content.name, content.arguments) === true) {
-				const reply = new ReplyWriteComponent({
-					requestRender: () => this.#deps.requestRender(),
-					imageBudget: this.#deps.ui.imageBudget,
-					linkTargets: this.#deps.linkTargets,
-				});
-				reply.updateArgs(content.arguments);
-				reply.setArgsComplete();
-				this.#mountProse(reply);
-				component = reply;
-			} else {
-				const card = new ToolExecutionComponent(
-					content.name,
-					content.arguments,
-					{
-						useBuiltInRenderer: builtIn,
-						// Stable ids and Kitty placeholder cells keep images anchored
-						// while the transcript viewport scrolls and reflows.
-						showImages: displayPreferences.showImages,
-					},
-					this.#deps.getTool?.(content.name),
-					this.#deps.ui,
-					this.#deps.cwd,
-					content.id,
-				);
-				this.#trackExpandable(card);
-				this.container.addChild(card);
-				component = card;
+			// A streamed `write` whose path could still grow into a reply URL opens neither a
+			// reply nor a card until its path decides which.
+			if (
+				!component &&
+				transient &&
+				(this.#deps.isBuiltInTool?.(renderName) ?? true) &&
+				isReplyWrite(renderName, args) === undefined
+			) {
+				continue;
 			}
-
-			if (hasErrorStop && errorMessage) {
-				component.updateResult(
-					{ content: [{ type: "text", text: errorMessage }], isError: true },
-					false,
-					content.id,
-				);
-			} else {
-				this.#pendingTools.set(content.id, component);
+			if (!component && renderName === "read" && readArgsCollapseIntoGroup(args)) {
+				if (errorMessage || afterToolSegment || transient) {
+					component = this.#ensureReadGroup();
+					state.tools.set(call.id, component);
+				} else {
+					this.#readArgs.set(call.id, normalizeToolArgs(args));
+				}
+			} else if (!component) {
+				this.#readGroup?.finalize();
+				this.#readGroup = null;
+				component = this.#createTool(call.id, call.name, args);
+				state.tools.set(call.id, component);
+				// A provider-id split can materialize an earlier sibling after the
+				// last sibling's retained card. Insert at the assistant timeline cursor.
+				const children = this.container.children;
+				const anchorIndex = children.indexOf(timelineAnchor);
+				if (anchorIndex >= 0 && anchorIndex < children.length - 2) {
+					children.splice(children.length - 1, 1);
+					children.splice(anchorIndex + 1, 0, component);
+				}
 			}
-			appendAssistantSegment(afterToolSegment);
+			if (component) {
+				timelineAnchor = component;
+				this.#readArgs.delete(call.id);
+				component.updateArgs(args, call.id);
+				if (!transient) component.setArgsComplete(call.id);
+				if (errorMessage) {
+					component.updateResult(
+						{ content: [{ type: "text", text: errorMessage }], isError: true },
+						false,
+						call.id,
+					);
+					this.#pendingTools.delete(call.id);
+					// The agent loop still emits synthetic execution/result events for
+					// this call; its already-settled card owns that completion.
+					this.#completedTools.add(call.id);
+				} else if (!this.#completedTools.has(call.id)) {
+					this.#pendingTools.set(call.id, component);
+					this.#consumeHeld(call.id);
+				}
+			}
+			if (afterToolSegment && assistantHasVisibleContent(afterToolSegment)) {
+				let segment = state.after.get(call.id);
+				if (!segment) {
+					segment = this.#createAssistant(afterToolSegment);
+					state.after.set(call.id, segment);
+					if (component) {
+						const children = this.container.children;
+						const anchorIndex = children.indexOf(component);
+						if (anchorIndex >= 0 && anchorIndex < children.length - 2) {
+							children.splice(children.length - 1, 1);
+							children.splice(anchorIndex + 1, 0, segment);
+						}
+					}
+				}
+				segment.updateContent(afterToolSegment, { transient });
+				lastAssistantComponent = segment;
+				timelineAnchor = segment;
+			}
 		}
-		const turnUsage = this.#turnUsage.add(message, this.#turnStartedAt);
-		if (turnUsage) lastAssistantComponent.setTurnUsage(turnUsage);
-
-		this.#pendingUsage =
-			displayPreferences.showTokenUsage && assistantUsageIsBilled(message.usage) ? message.usage : undefined;
-		this.#pendingUsageDuration = message.duration;
-		this.#pendingUsageTtft = message.ttft;
-		this.#pendingUsageTimestamp = message.timestamp;
-		this.#pendingReadUsageCallIds = this.#pendingUsage ? groupedReadUsageCallIds(message) : undefined;
-		this.#pendingUsageElapsedMs =
-			this.#pendingUsage && displayPreferences.showTurnTime ? this.#turnElapsedMs(message) : undefined;
+		if (!transient) {
+			assistantComponent.markTranscriptBlockFinalized();
+			for (const component of state.after.values()) component.markTranscriptBlockFinalized();
+			if (this.#preferences.cacheMissMarker) {
+				const invalidation = detectCacheInvalidation(this.#lastAssistantUsage, message.usage);
+				if (invalidation) assistantComponent.setCacheInvalidation(invalidation);
+			}
+			if (previous) assistantComponent.setServedModelMismatch(this.#servedModelTracker.check(message));
+			if (message.usage.cacheRead + message.usage.cacheWrite + message.usage.input > 0) {
+				this.#lastAssistantUsage = message.usage;
+			}
+			const turnUsage = this.#turnUsage.add(message, this.#turnStartedAt);
+			if (turnUsage) lastAssistantComponent.setTurnUsage(turnUsage);
+			this.#pendingUsage =
+				this.#preferences.showTokenUsage && assistantUsageIsBilled(message.usage) ? message.usage : undefined;
+			this.#pendingUsageDuration = message.duration;
+			this.#pendingUsageTtft = message.ttft;
+			this.#pendingUsageTimestamp = message.timestamp;
+			this.#pendingReadUsageCallIds = this.#pendingUsage ? groupedReadUsageCallIds(message) : undefined;
+			this.#pendingUsageElapsedMs =
+				this.#pendingUsage && this.#preferences.showTurnTime ? this.#turnElapsedMs(message) : undefined;
+		}
+		return state;
 	}
 
 	#appendToolResult(message: Extract<AgentMessage, { role: "toolResult" }>): void {
+		if (this.#completedTools.has(message.toolCallId)) return;
 		const pending = this.#pendingTools.get(message.toolCallId);
 		const isReadGroupResult = message.toolName === "read" && (!pending || pending instanceof ReadToolGroupComponent);
 		if (isReadGroupResult) {
@@ -564,6 +856,7 @@ export class ChatTranscriptBuilder {
 			component.updateResult(message, false, message.toolCallId);
 			this.#pendingTools.delete(message.toolCallId);
 			this.#readArgs.delete(message.toolCallId);
+			this.#completedTools.add(message.toolCallId);
 			return;
 		}
 		for (const reply of toolResultReplies(message.details)) {
@@ -580,8 +873,17 @@ export class ChatTranscriptBuilder {
 			);
 		}
 		if (!pending) return;
+		const asyncState = (message.details as { async?: { state?: string } } | undefined)?.async?.state;
+		if (message.toolName === "task" && asyncState === "running") {
+			pending.updateResult(message, true, message.toolCallId);
+			pending.parkAsBackground();
+			this.#backgroundTools.add(message.toolCallId);
+			return;
+		}
 		pending.updateResult(message, false, message.toolCallId);
 		this.#pendingTools.delete(message.toolCallId);
+		this.#backgroundTools.delete(message.toolCallId);
+		this.#completedTools.add(message.toolCallId);
 		if (message.toolName === "wait" && pending instanceof ToolExecutionComponent && pending.isDisplaceableBlock()) {
 			this.#waitingPoll = pending;
 		} else if (
