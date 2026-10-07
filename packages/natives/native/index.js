@@ -27,6 +27,7 @@ export const AudioCapture = nativeBindings.AudioCapture;
 export const AudioPlayback = nativeBindings.AudioPlayback;
 export const DesktopSession = adaptDesktopSession(nativeBindings.DesktopSession);
 export const DiffStream = nativeBindings.DiffStream;
+export const DuplexFd = nativeBindings.DuplexFd;
 export const EditSession = nativeBindings.EditSession;
 export const EditStore = nativeBindings.EditStore;
 export const FileLock = nativeBindings.FileLock;

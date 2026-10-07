@@ -250,6 +250,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					await runtime.output(`Compaction failed: ${errorMessage(err)}`);
 					return;
 				}
+				await runtime.notifyHistoryChanged?.();
 				const after = runtime.session.getContextUsage?.();
 				const afterTokens = after?.tokens;
 				if (beforeTokens != null && afterTokens != null) {
@@ -318,6 +319,14 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			const mode = parseShakeMode(command.args);
 			if (typeof mode !== "string") return usage(mode.error, runtime);
 			const result = await runtime.session.shake(mode);
+			if (
+				result.toolResultsDropped > 0 ||
+				result.blocksDropped > 0 ||
+				(result.imagesDropped ?? 0) > 0 ||
+				(result.thinkingBlocksDropped ?? 0) > 0
+			) {
+				await runtime.notifyHistoryChanged?.();
+			}
 			await runtime.output(formatShakeSummary(result));
 			return commandConsumed();
 		},
@@ -385,6 +394,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					await runtime.output("Handoff cancelled.");
 					return;
 				}
+				await runtime.notifyHistoryChanged?.();
 				// `savedPath` is deliberately not reported: `SessionHandoff` only writes
 				// the document to disk when `options.autoTriggered` is set, which the
 				// user-invoked path never passes.

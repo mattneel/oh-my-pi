@@ -95,6 +95,7 @@ import {
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
+import type { AcpPresentation } from "./acp-presentation";
 
 import { cfgDisabledExtensions } from "../../extensibility/settings";
 import { cfgPlanEnabled } from "../../plan-mode/settings";
@@ -794,15 +795,22 @@ export class AcpAgent implements Agent {
 	#createSession: CreateAcpSession;
 	#sessions = new Map<string, ManagedSessionRecord>();
 	#disposePromise: Promise<void> | undefined;
+	#presentation: AcpPresentation | undefined;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
 	#blobs = new BlobStore(getBlobsDir());
 
-	constructor(connection: AgentSideConnection, createSession: CreateAcpSession, initialSession?: AgentSession) {
+	constructor(
+		connection: AgentSideConnection,
+		createSession: CreateAcpSession,
+		initialSession?: AgentSession,
+		presentation?: AcpPresentation,
+	) {
 		this.#connection = connection;
 		this.#initialSession = initialSession;
 		this.#createSession = createSession;
+		this.#presentation = presentation;
 	}
 
 	setCancelCleanupTimeoutForTesting(timeoutMs: number): void {
@@ -877,6 +885,7 @@ export class AcpAgent implements Agent {
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#createNewSessionRecord(params.cwd, params.mcpServers);
+		this.#presentation?.showSession(record.session);
 		const response: NewSessionResponse = {
 			sessionId: record.session.sessionId,
 			configOptions: this.#buildConfigOptions(record.session),
@@ -889,6 +898,7 @@ export class AcpAgent implements Agent {
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#loadManagedSession(params.sessionId, params.cwd, params.mcpServers);
+		this.#presentation?.showSession(record.session);
 		await this.#replaySessionHistory(record);
 		const response: LoadSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
@@ -918,6 +928,7 @@ export class AcpAgent implements Agent {
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#resumeManagedSession(params.sessionId, params.cwd, params.mcpServers ?? []);
+		this.#presentation?.showSession(record.session);
 		const response: ResumeSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
@@ -929,6 +940,7 @@ export class AcpAgent implements Agent {
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#forkManagedSession(params);
+		this.#presentation?.showSession(record.session);
 		const response: ForkSessionResponse = {
 			sessionId: record.session.sessionId,
 			configOptions: this.#buildConfigOptions(record.session),
@@ -1006,6 +1018,7 @@ export class AcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
+		this.#presentation?.showSession(record.session);
 		const activeTurn = record.promptTurn;
 		// A `_session/steering` refusal (`promptRequired`) now only ever
 		// happens while no client prompt owns the turn (idle, or an
@@ -1220,6 +1233,7 @@ export class AcpAgent implements Agent {
 			// ACP-declared servers (`session/new` `mcpServers`) live in this
 			// manager, in no writable config file; `/mcp` lookups must consult it.
 			mcpManager: record.mcpManager,
+			notifyHistoryChanged: () => this.#presentation?.refreshSession(record.session),
 			keepTurnOpenUntilIdle: async () => {
 				await record.session.waitForIdle();
 				// `AgentSession.#emit()` does not await listeners, so the retried
@@ -2977,6 +2991,10 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
+		const compact = async (instructionsOrOptions: Parameters<typeof runExtensionCompact>[1]): Promise<void> => {
+			await runExtensionCompact(record.session, instructionsOrOptions);
+			this.#presentation?.refreshSession(record.session);
+		};
 		extensionRunner.initialize(
 			{
 				sendMessage: (message, options) => {
@@ -3025,7 +3043,7 @@ export class AcpAgent implements Agent {
 				getContextUsage: () => record.session.getContextUsage(),
 				getSystemPrompt: () => record.session.systemPrompt,
 				runEphemeralTurn: args => record.session.runEphemeralTurn(args),
-				compact: instructionsOrOptions => runExtensionCompact(record.session, instructionsOrOptions),
+				compact,
 			},
 			{
 				getContextUsage: () => record.session.getContextUsage(),
@@ -3035,24 +3053,28 @@ export class AcpAgent implements Agent {
 					if (success && options?.setup) {
 						await options.setup(record.session.sessionManager);
 					}
+					if (success) this.#presentation?.showSession(record.session, true);
 					return { cancelled: !success };
 				},
 				branch: async entryId => {
 					const result = await record.session.branch(entryId);
+					if (!result.cancelled) this.#presentation?.showSession(record.session, true);
 					return { cancelled: result.cancelled };
 				},
 				navigateTree: async (targetId, options) => {
 					const result = await record.session.navigateTree(targetId, { summarize: options?.summarize });
+					if (!result.cancelled) this.#presentation?.showSession(record.session, true);
 					return { cancelled: result.cancelled };
 				},
 				switchSession: async sessionPath => {
 					const success = await record.session.switchSession(sessionPath);
+					if (success) this.#presentation?.showSession(record.session, true);
 					return { cancelled: !success };
 				},
 				reload: async () => {
 					await record.session.reload();
 				},
-				compact: instructionsOrOptions => runExtensionCompact(record.session, instructionsOrOptions),
+				compact,
 			},
 			uiContext,
 			"rpc",
@@ -3198,6 +3220,7 @@ export class AcpAgent implements Agent {
 
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
+		this.#presentation?.removeSession(record.session);
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();
@@ -3229,6 +3252,7 @@ export class AcpAgent implements Agent {
 		}
 
 		this.#disposePromise = (async () => {
+			await this.#presentation?.close();
 			const records = Array.from(this.#sessions.entries());
 			this.#sessions.clear();
 			await Promise.all(

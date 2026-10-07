@@ -220,7 +220,7 @@ export interface TUIStartOptions {
 	deferInput?: boolean;
 }
 
-const DEFAULT_RENDER_SCHEDULER: RenderScheduler = {
+export const DEFAULT_RENDER_SCHEDULER: RenderScheduler = {
 	now: () => performance.now(),
 	scheduleImmediate: callback => {
 		setImmediate(callback);

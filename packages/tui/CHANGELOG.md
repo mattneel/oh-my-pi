@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Native TSP presentation supports dedicated duplex connections and live transcript updates without an interactive terminal.
+
 ## [18.14.1] - 2026-10-31
 
 ### Added

@@ -179,6 +179,7 @@ See [providers](./providers.md) and [models](./models.md) for model resolution.
 | `--mode <mode>` | Output/transport mode: `text` (default), `json`, `rpc`, `acp`, or `rpc-ui`. See [output modes](#output-modes---mode). |
 | `--print`, `-p` | Process prompts non-interactively and exit.                                                                           |
 | `--no-ui`       | With `rpc`/`rpc-ui`, make extensions headless without disabling rpc-ui tool UI.                                       |
+| `--tsp [fd\|socket]` | ACP only: use an independent duplex Tern Surface Protocol channel; bare `--tsp` uses inherited fd 3. See [ACP presentation](#acp-presentation). |
 
 #### Information
 
@@ -255,6 +256,45 @@ print-mode disposal semantics when the advisor runtime is enabled.
 | `acp`    | Agent Client Protocol server over stdio. Equivalent to the [`acp`](#subcommands) subcommand; see [approval mode → ACP sessions](./approval-mode.md#acp-sessions). |
 
 `--no-ui` (with `--mode rpc` or `--mode rpc-ui`) runs extensions headless: `ctx.hasUI` is `false`, extension dialogs resolve to defaults, and extension presentation updates are dropped. In `rpc-ui`, tool UI such as `ask` still sends `extension_ui_request` frames for the host to answer. Host-issued `login` UI is unaffected. See [RPC startup](./rpc.md#startup).
+
+### ACP presentation
+
+```sh
+omp acp --tsp                   # inherited duplex fd 3
+omp acp --tsp 4                 # inherited duplex fd 4
+omp acp --tsp /run/omp.tsp       # connect to an already-listening Unix socket
+```
+
+`--tsp=4` and `--tsp=/run/omp.tsp` are equivalent. Decimal integers select an
+inherited full-duplex descriptor; other values are Unix-domain socket paths.
+Descriptors 0–2 are reserved: stdin and stdout remain ACP JSON-RPC, and stderr
+remains diagnostics. No TSP bytes are written to ACP stdout.
+Inherited PTY endpoints must already be in raw mode; OMP does not configure or
+probe a terminal for this explicit channel.
+This side channel is currently supported on Unix platforms only.
+In ACP mode, `--tsp` is a process-level transport flag and cannot be shadowed by
+per-session extensions; other extension flag precedence is unchanged.
+Use `--flag=--tsp…` when a string option needs literal flag-looking text;
+a separate `--tsp` token always selects the ACP process transport.
+
+The side channel carries ordinary [Tern Surface Protocol](./tui-core-renderer.md#native-rendering-tern-surface-protocol),
+not an ACP envelope. OMP sends the normal hello query; the host replies on the
+same stream and receives the shared semantic transcript, palette, frames and
+blobs. Acknowledgements, replies and semantic input events travel back over
+that duplex channel. The most recently created, loaded, resumed, forked or
+prompted session is presented. Prompts, permissions and elicitation remain ACP
+operations; this does not enable terminal-interactive startup.
+
+An explicit target that cannot be opened or connected, or does not complete
+the hello negotiation, fails startup with a diagnostic. A later disconnect
+stops presentation and logs the condition while ACP continues; there is no
+reconnect. Presentation also stops if its retained outbound queue exceeds
+64 MiB or goes 60 seconds without draining above 256 KiB. Pending transcript
+changes coalesce while output is backpressured. Inbound logical messages and
+unfinished reassembly are each bounded to 16 MiB, with at most 1024 unfinished
+messages; exceeding these limits also stops presentation, not ACP.
+Without `--tsp`, ACP behavior is unchanged. The flag is not supported in RPC
+or ordinary interactive mode.
 
 ## Subcommands
 

@@ -3,9 +3,9 @@
  * Shares the same kernel session as the agent's eval tool.
  */
 
-import type { Loader } from "../components/loader";
+import type { Loader, LoaderUI } from "../components/loader";
 import { Text } from "../components/text";
-import { Container, type TUI } from "../tui";
+import { Container } from "../tui";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { highlightCode, theme } from "../theme/theme";
 import type { OutputArtifactError } from "../tools/streaming-output";
@@ -65,7 +65,7 @@ export class EvalExecutionComponent extends Container {
 		return new Text(headerLines.join("\n"), 1, 0);
 	}
 
-	constructor(code: string, ui: TUI, excludeFromContext = false, language: EvalExecutionLanguage = "python") {
+	constructor(code: string, ui: LoaderUI, excludeFromContext = false, language: EvalExecutionLanguage = "python") {
 		super();
 		this.#code = code;
 		this.#excludeFromContext = excludeFromContext;

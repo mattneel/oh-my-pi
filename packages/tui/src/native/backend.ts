@@ -44,7 +44,14 @@ import type { Component, OverlayOptions, RenderScheduler, RenderTimer } from "..
 import { TspDocument } from "./apply";
 import { getNativeBlob, type NativeBlob } from "./blobs";
 import { node } from "./describe";
-import { encodeTspJson, encodeTspMessage, type TspHello, TspReader, splitTspMessage } from "./encode";
+import {
+	encodeTspJson,
+	encodeTspMessage,
+	type TspHello,
+	TspReader,
+	type TspReaderLimits,
+	splitTspMessage,
+} from "./encode";
 import type { DescribeContext, NativeChild, NativeNode, NativeSurface, NativeUiEvent } from "./node";
 import { NARROW_SHEET_COLS } from "./overlay";
 import { nativeComponentId, Reconciler } from "./reconcile";
@@ -60,7 +67,7 @@ export interface NativeOverlay {
 
 /** What the backend needs from the TUI. */
 export interface NativeHost {
-	readonly terminal: Terminal;
+	readonly terminal: Pick<Terminal, "columns" | "appearance" | "write">;
 	/** `main`/`dock` content: the frame provider's surface, or the TUI children. */
 	describeSurface(cx: DescribeContext): NativeSurface;
 	/** Visible overlays, bottom to top. */
@@ -97,6 +104,8 @@ export interface NativeBackendOptions {
 	readonly stats?: boolean;
 	/** Clock and timers (stall wake-up); defaults to `Date.now` and unref'd `setTimeout`. */
 	readonly scheduler?: RenderScheduler;
+	/** Bound incomplete input for an explicitly attached presentation peer; terminal behavior is unchanged by default. */
+	readonly inputLimits?: TspReaderLimits;
 }
 
 /** Real clock and timers that never keep the process alive on their own. */
@@ -292,7 +301,7 @@ export class NativeBackend {
 	#cx: NativeContext;
 	#limit: number;
 	#credits: number;
-	#reader = new TspReader();
+	#reader: TspReader;
 	#inline: Surface;
 	#screen: Surface | null = null;
 	#nextSurface = 1;
@@ -318,6 +327,7 @@ export class NativeBackend {
 	constructor(host: NativeHost, hello: TspHello, options: NativeBackendOptions = {}) {
 		this.#host = host;
 		this.#hello = hello;
+		this.#reader = new TspReader(options.inputLimits);
 		this.#cx = new NativeContext(hello, hello.cols ?? host.terminal.columns);
 		this.#limit = TSP_DEFAULT_APC_LIMIT;
 		this.#credits = TSP_DEFAULT_CREDITS;
@@ -373,6 +383,7 @@ export class NativeBackend {
 	 * `keep` is false (a revoked optimistic start: rows repaint from scratch).
 	 */
 	stop(keep = true): void {
+		this.#reader.clear();
 		if (!this.#live) return;
 		this.#live = false;
 		if (this.#screen) this.#close(this.#screen, false);

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- ACP hosts can receive the shared native TSP transcript over an optional duplex side channel with `omp acp --tsp [fd|socket]`, independently of ACP stdio.
+
 ## [18.14.1] - 2026-10-31
 
 ### Added

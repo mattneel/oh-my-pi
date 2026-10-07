@@ -69,6 +69,8 @@ export interface Args {
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
+	/** ACP-only duplex Tern Surface Protocol presentation FD or Unix socket path. */
+	tsp?: number | string;
 	noSession?: boolean;
 	sessionDir?: string;
 	providerSessionId?: string;
@@ -123,6 +125,30 @@ export interface Args {
 	 * {@link reportInvalidFlagValues}.
 	 */
 	invalidFlagValues: string[];
+}
+
+/** Validate explicit presentation once mode and extension flag ownership are known. */
+export function validateTspLaunch(args: Args, mode: Mode | undefined): void {
+	if (args.tsp === undefined) return;
+	if (mode !== "acp") {
+		throw new CliUsageError("--tsp requires ACP mode (use `omp acp --tsp` or `--mode acp --tsp`).");
+	}
+	if (typeof args.tsp === "number") {
+		if (!Number.isSafeInteger(args.tsp) || args.tsp > 0x7fffffff) {
+			throw new CliUsageError(
+				`Invalid --tsp file descriptor: ${args.tsp}. Expected an integer from 3 to 2147483647.`,
+			);
+		}
+		if (args.tsp < 3) {
+			throw new CliUsageError(
+				"--tsp file descriptor must be at least 3; descriptors 0, 1, and 2 are reserved for ACP stdio and diagnostics.",
+			);
+		}
+	} else if (args.tsp.length === 0) {
+		throw new CliUsageError(
+			"--tsp requires a non-empty file descriptor or Unix socket path when a value is supplied.",
+		);
+	}
 }
 
 /**
@@ -237,7 +263,16 @@ function consumeBuiltInStringValue(flag: string, args: string[], valueIndex: num
 	return { value, index: valueIndex };
 }
 
-export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { type: "boolean" | "string" }>): Args {
+export interface ParseArgsOptions {
+	/** The ACP subcommand selects its process mode before parsing session flags. */
+	processMode?: Mode;
+}
+
+export function parseArgs(
+	inputArgs: string[],
+	extensionFlags?: Map<string, { type: "boolean" | "string" }>,
+	options?: ParseArgsOptions,
+): Args {
 	// Work on a copy: the `--option=value` handling below splices the value
 	// into the array, and callers reuse the same argv (the post-extension
 	// reparse in `runRootCommand` parses it a second time). Mutating the input
@@ -257,6 +292,7 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 	// literal positional text, so flag-shaped messages are not parsed or rejected.
 	let sawSeparator = false;
 	let trustedFlagCount = 0;
+	let sawTspToken = false;
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
 		if (sawSeparator) {
@@ -267,6 +303,7 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			continue;
 		}
 		const flagIndex = i;
+		if (arg === "--tsp" || arg.startsWith("--tsp=")) sawTspToken = true;
 
 		// Support --flag=value syntax (e.g. --tools=ask,read). The value is
 		// spliced in as the next token so value-consuming flags pick it up via
@@ -287,7 +324,10 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		// value-taking built-in (`--plan`, `--model`, …) that branch would consume
 		// the following token — eating the user's message and setting the wrong
 		// built-in field — so registered flags shadow same-named built-ins here.
-		const extFlag = arg.startsWith("--") ? extensionFlags?.get(arg.slice(2)) : undefined;
+		const extFlag =
+			arg.startsWith("--") && !(options?.processMode === "acp" && arg === "--tsp")
+				? extensionFlags?.get(arg.slice(2))
+				: undefined;
 		if (extFlag) {
 			const flagName = arg.slice(2);
 			if (extFlag.type === "boolean") {
@@ -302,6 +342,16 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			}
 		} else if (STRING_VALUE_FLAGS.has(arg)) {
 			if (arg === "--trusted-extension") trustedFlagCount++;
+			// ACP reserves this process-level token even before a preceding boolean
+			// extension flag is known. Explicit `--flag=--tsp…` remains a literal value.
+			const nextIsTsp = equalsValueIndex === -1 && (args[i + 1] === "--tsp" || args[i + 1]?.startsWith("--tsp="));
+			if (nextIsTsp) {
+				sawTspToken = true;
+				if (options?.processMode === "acp") {
+					result.invalidFlagValues.push(`${arg} requires a value; use ${arg}=… for literal --tsp text.`);
+					continue;
+				}
+			}
 			// Built-in string flags consume the next token even when it is flag-looking
 			// (`--system-prompt --profile foo` ⇒ the prompt is the literal "--profile").
 			// The one token they must never absorb is the profile bootstrap's internal
@@ -329,7 +379,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			const config = OPTIONAL_FLAGS[arg];
 			const next = args[i + 1];
 			const consume =
-				next !== undefined && !next.startsWith("-") && !(config.rejectEmpty === true && next.length === 0);
+				next !== undefined &&
+				(!next.startsWith("-") || (equalsValueIndex !== -1 && config.allowExplicitFlagValue === true)) &&
+				!(config.rejectEmpty === true && next.length === 0);
 			config.set(result, consume ? args[++i] : undefined);
 		} else if (arg === "--help" || arg === "-h") {
 			result.help = true;
@@ -424,6 +476,12 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		if (equalsValueIndex !== -1 && i === flagIndex) {
 			args.splice(equalsValueIndex, 1);
 		}
+	}
+
+	// Generic launches learn their mode during parsing. Only a requested --tsp
+	// needs another pass with ACP's reservation; launches without it are unchanged.
+	if (sawTspToken && result.mode === "acp" && options?.processMode !== "acp") {
+		return parseArgs(inputArgs, extensionFlags, { processMode: "acp" });
 	}
 
 	const swallowedTrustedFlag = [...(result.extensions ?? []), ...(result.hooks ?? [])].some(

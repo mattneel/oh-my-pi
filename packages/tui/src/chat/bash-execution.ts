@@ -4,7 +4,7 @@
 
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { Image } from "../components/image";
-import type { Loader } from "../components/loader";
+import type { Loader, LoaderUI } from "../components/loader";
 import { Text } from "../components/text";
 import { getImageDimensions, imageFallback, ImageProtocol, TERMINAL } from "../terminal-capabilities";
 import { Container, type TUI } from "../tui";
@@ -46,8 +46,13 @@ const PTY_SCROLLBACK_ROWS = 4096;
 const MAX_PTY_QUEUE_CHUNKS = 512;
 let nextBashExecutionId = 0;
 
+type BashExecutionUI = LoaderUI &
+	Pick<TUI, "imageBudget"> & {
+		readonly terminal?: Pick<TUI["terminal"], "columns" | "rows">;
+	};
+
 /** PTY size for `!` commands: the execution frame's inner content area. */
-export function bashPtyViewport(ui: TUI): { cols: number; rows: number } {
+export function bashPtyViewport(ui: Pick<BashExecutionUI, "terminal">): { cols: number; rows: number } {
 	return {
 		cols: Math.max(20, (ui.terminal?.columns ?? 80) - 2),
 		rows: Math.max(5, (ui.terminal?.rows ?? 24) - 4),
@@ -72,7 +77,7 @@ export class BashExecutionComponent extends Container {
 	#contentContainer: Container;
 	#outputPane: OutputPane;
 	#headerText: Text;
-	#ui: TUI;
+	#ui: BashExecutionUI;
 	// PTY replay state: raw terminal bytes stream into a headless xterm and the
 	// display lines are re-read from its screen+scrollback (same pipeline as
 	// `launch` logs), so color survives and CR/cursor movement render correctly.
@@ -95,7 +100,7 @@ export class BashExecutionComponent extends Container {
 	readonly #native = new Memo();
 	readonly #nativeImages = new NativeImageCache();
 
-	constructor(command: string, ui: TUI, excludeFromContext = false) {
+	constructor(command: string, ui: BashExecutionUI, excludeFromContext = false) {
 		super();
 		this.#command = command;
 		this.#ui = ui;

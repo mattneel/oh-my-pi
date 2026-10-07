@@ -25,6 +25,7 @@ import { readMediaPath } from "@oh-my-pi/pi-tui/native/blobs";
 import { TodoReminderComponent } from "@oh-my-pi/pi-tui/chat/todo-reminder";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { reconcileStreamedToolCallIds } from "@oh-my-pi/pi-tui/chat/streamed-tool-call-ids";
 import {
 	asyncJobState,
 	isSettledJobFrame,
@@ -755,39 +756,12 @@ export class EventController {
 	 * card (a reverse ghost).
 	 */
 	#reconcileStreamedToolCallIds(content: AssistantMessage["content"]): void {
-		const finalIdByIndex = new Map<number, string>();
-		for (let contentIndex = 0; contentIndex < content.length; contentIndex++) {
-			const block = content[contentIndex]!;
-			if (block.type === "toolCall") finalIdByIndex.set(contentIndex, block.id);
-		}
-		for (const [contentIndex, id] of finalIdByIndex) {
-			const priorId = this.#streamedToolCallIdByIndex.get(contentIndex);
-			if (priorId === undefined || priorId === id) {
-				this.#streamedToolCallIdByIndex.set(contentIndex, id);
-				continue;
-			}
-			const oldIdStaysOwned = [...finalIdByIndex].some(([otherIndex, otherId]) => {
-				if (otherIndex === contentIndex) return false;
-				// The other index either already resolved to the old id or still
-				// streams under it and has not been re-keyed yet.
-				return otherId === priorId || this.#streamedToolCallIdByIndex.get(otherIndex) === priorId;
-			});
-			if (oldIdStaysOwned) {
-				// The shared card stays under `priorId` for its remaining
-				// referencer; make it show THAT call's arguments, not the last
-				// cumulative update's (every sibling updated the one shared card
-				// while the id was still shared).
-				const card = this.ctx.pendingTools.get(priorId);
-				for (const [keeperIndex, keeperId] of finalIdByIndex) {
-					if (keeperId !== priorId || keeperIndex === contentIndex) continue;
-					const keeper = content[keeperIndex];
-					if (card && keeper?.type === "toolCall") card.updateArgs(keeper.arguments, priorId);
-				}
-			} else {
-				this.#migrateStreamedToolCallId(priorId, id);
-			}
-			this.#streamedToolCallIdByIndex.set(contentIndex, id);
-		}
+		reconcileStreamedToolCallIds(
+			content,
+			this.#streamedToolCallIdByIndex,
+			(oldId, newId) => this.#migrateStreamedToolCallId(oldId, newId),
+			(id, call) => this.ctx.pendingTools.get(id)?.updateArgs(call.arguments, id),
+		);
 	}
 
 	#inlineReadToolImages(

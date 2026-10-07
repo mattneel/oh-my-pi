@@ -208,6 +208,18 @@ queue early. The
 debug socket's `doc` op returns the reference document
 (every sent frame applied by `native/apply.ts`), and `tsp` returns recent frames.
 
+ACP can attach this same native backend to a dedicated duplex FD or Unix
+socket with [`omp acp --tsp`](./cli-reference.md#acp-presentation). This
+explicit channel sends only ordinary TSP: no DA1 sentinel, terminal capability
+probes, environment-based detection or optimistic row fallback. Its hello
+reply must select the supported protocol version before presentation starts.
+The shared `ChatTranscriptBuilder` supplies recorded and live assistant/tool
+components; the existing reconciler, credits, blobs, themes and component
+input handlers are unchanged. ACP owns session control and elicitation.
+Session creation remains headless (`hasUI: false`), with its existing ACP
+extension-UI/elicitation bridge unchanged; no `ProcessTerminal`, composer or
+interactive startup is created. One backend presents the selected ACP session.
+
 #### Explicit composer submission
 
 omp's `q: "hello"` advertises `features: ["edit", "undo", "send"]`.

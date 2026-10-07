@@ -130,6 +130,8 @@ export interface SlashCommandRuntime {
 	 */
 	mcpManager?: MCPManager | undefined;
 	notifyTitleChanged?: () => Promise<void> | void;
+	/** Refresh an attached presentation after a successful conversation-history rewrite. */
+	notifyHistoryChanged?: () => Promise<void> | void;
 	/**
 	 * Push the host's view of the session config (model, thinking level, mode).
 	 *
