@@ -3,6 +3,7 @@ import { APP_NAME } from "@oh-my-pi/pi-utils/dirs";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/key-hint-format";
 import { CLI_THINKING_LEVELS } from "@oh-my-pi/pi-tui/thinking";
 import { SERVICE_TIER_OPENAI_VALUES } from "../config/service-tier";
+import { acpHelp } from "../cli/command-help";
 
 export const launchHelp = {
 	description: "AI coding assistant",
@@ -53,6 +54,7 @@ export const launchHelp = {
 			description: "Output mode: text (default), json, rpc, or rpc-ui",
 			options: ["text", "json", "rpc", "acp", "rpc-ui"],
 		}),
+		tsp: acpHelp.flags.tsp,
 		config: Flags.string({
 			description: "Load an extra config.yml-style overlay for this run (repeatable)",
 			multiple: true,

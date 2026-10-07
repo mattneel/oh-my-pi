@@ -7,10 +7,10 @@
  * stay in their respective files.
  */
 
-import { Loader } from "../components/loader";
+import { Loader, type LoaderUI } from "../components/loader";
 import { Text } from "../components/text";
 import { Container, type TUI } from "../tui";
-import { theme } from "../theme/theme";
+import { getSymbolTheme, theme } from "../theme/theme";
 import type { OutputArtifactError } from "../tools/streaming-output";
 import {
 	formatArtifactErrorNotice,
@@ -58,7 +58,7 @@ export type ExecutionColorKey = "dim" | "bashMode" | "pythonMode";
  */
 export function buildExecutionFrame(
 	parent: Container,
-	ui: TUI,
+	ui: LoaderUI,
 	colorKey: ExecutionColorKey,
 ): { contentContainer: Container; loader: Loader; bottomBorder: DynamicBorder } {
 	const borderColor = (str: string) => theme.fg(colorKey, str);

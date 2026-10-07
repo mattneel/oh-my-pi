@@ -98,12 +98,16 @@ export type LoaderMessageColorFn = ColorFn & {
 	readonly animated?: true;
 };
 
+/** Painting capabilities shared by terminal UI and semantic presentation hosts. */
+export type LoaderUI = Pick<TUI, "requestComponentRender" | "lastFrameCostMs"> &
+	Partial<Pick<TUI, "synchronizedOutput">>;
+
 /** Animates a spinner and colorized message while asynchronous work is pending. */
 export class Loader extends Text {
 	#frames = DEFAULT_SPINNER_FRAMES;
 	#currentFrame = 0;
 	#intervalId?: NodeJS.Timeout;
-	#ui: TUI | null = null;
+	#ui: LoaderUI | null = null;
 	#lastSpinnerTick = 0;
 	#layoutSource?: readonly string[];
 	#layout?: readonly {
@@ -123,7 +127,7 @@ export class Loader extends Text {
 	#nativeTimer?: NodeJS.Timeout;
 
 	constructor(
-		ui: TUI,
+		ui: LoaderUI,
 		private spinnerColorFn: ColorFn,
 		private messageColorFn: LoaderMessageColorFn,
 		private message: string | (() => string) = "Loading...",

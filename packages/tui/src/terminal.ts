@@ -291,7 +291,7 @@ const STDOUT_STALL_POLL_MS = 250;
  * a draining terminal keeps lowering the mark and never trips, while a wedged
  * one (#6854) still tears down within the window.
  *
- * Exported for unit testing; `ProcessTerminal` is the sole production user.
+ * Shared by terminal stdout and dedicated TSP channels.
  */
 export class StdoutStallWatchdog {
 	#lowWater = Number.POSITIVE_INFINITY;

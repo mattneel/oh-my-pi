@@ -5,6 +5,7 @@ import { AgentSideConnection, ndJsonStream, type Stream } from "@oh-my-pi/pi-uti
 import type { ExtensionUIContext } from "../../extensibility/extensions/types";
 import type { AgentSession } from "../../session/agent-session";
 import { AcpAgent } from "./acp-agent";
+import { AcpPresentation } from "./acp-presentation";
 
 /** Session and deferred tool UI hook created for an ACP client workspace. */
 export interface AcpSessionHandle {
@@ -23,15 +24,21 @@ export type AcpSessionFactory = (
 	options?: { interactivePrompts?: boolean },
 ) => Promise<AgentSession | AcpSessionHandle>;
 
+/** ACP control remains on stdio; presentation is an optional independent duplex channel. */
+export interface AcpModeOptions {
+	tsp?: number | string;
+}
+
 /** Creates an ACP connection and exposes its agent when process-level teardown must own it. */
 export function createAcpConnection(
 	transport: Stream,
 	createSession: AcpSessionFactory,
 	initialSession?: AgentSession,
 	onAgent?: (agent: AcpAgent) => void,
+	presentation?: AcpPresentation,
 ): AgentSideConnection {
 	return new AgentSideConnection(connection => {
-		const agent = new AcpAgent(connection, createSession, initialSession);
+		const agent = new AcpAgent(connection, createSession, initialSession, presentation);
 		onAgent?.(agent);
 		return agent;
 	}, transport);
@@ -71,7 +78,11 @@ function formatConsoleArgs(args: unknown[]): string {
 }
 
 /** Serves ACP over stdio until the peer disconnects, then awaits session teardown before exit. */
-export async function runAcpMode(createSession: AcpSessionFactory, initialSession?: AgentSession): Promise<void> {
+export async function runAcpMode(
+	createSession: AcpSessionFactory,
+	initialSession?: AgentSession,
+	options: AcpModeOptions = {},
+): Promise<void> {
 	// Humans who run `omp acp` by hand see a silent process and assume it is
 	// broken (stdout is the JSON-RPC transport, so nothing may be printed
 	// there). When stdin is a TTY no ACP client is attached — say so on stderr
@@ -84,14 +95,33 @@ export async function runAcpMode(createSession: AcpSessionFactory, initialSessio
 		);
 	}
 	let agent: AcpAgent | undefined;
-	postmortem.register("acp-session-teardown", reason => agent?.dispose(reason));
+	let presentation: AcpPresentation | undefined;
+	postmortem.register("acp-session-teardown", async reason => {
+		await presentation?.close();
+		await agent?.dispose(reason);
+	});
 	postmortem.registerStdioDisconnectHandling();
 	const input = stream.Writable.toWeb(isolateProtocolStdout());
+	if (options.tsp !== undefined) {
+		try {
+			presentation = await AcpPresentation.connect(options.tsp);
+		} catch (error) {
+			process.stderr.write(`omp acp --tsp: ${error instanceof Error ? error.message : String(error)}\n`);
+			await postmortem.quit(1);
+			return;
+		}
+	}
 	const output = stream.Readable.toWeb(process.stdin);
 	const transport = ndJsonStream(input, output);
-	const connection = createAcpConnection(transport, createSession, initialSession, createdAgent => {
-		agent = createdAgent;
-	});
+	const connection = createAcpConnection(
+		transport,
+		createSession,
+		initialSession,
+		createdAgent => {
+			agent = createdAgent;
+		},
+		presentation,
+	);
 	await connection.closed;
 	await postmortem.quit(0);
 }

@@ -181,6 +181,46 @@ export declare class DiffStream {
   finish(context?: number | undefined | null): Promise<DiffStreamResult>
 }
 
+/**
+ * One reader and one writer on an owned duplicate of a borrowed Unix fd.
+ *
+ * Concurrent calls in each direction are serialized. Closing cancels pending
+ * and queued I/O with an error; `null` from read means actual peer EOF only.
+ */
+export declare class DuplexFd {
+  /**
+   * Duplicate and adopt a descriptor opened for both reading and writing.
+   *
+   * The caller retains the original and may close it after this returns.
+   * Sockets and raw PTY endpoints are supported without terminal setup;
+   * descriptors the OS readiness reactor cannot register are rejected.
+   * On failure, the original remains open and its status flags are unchanged.
+   * Non-Unix hosts reject adoption explicitly.
+   */
+  static open(fd: number): DuplexFd
+  /**
+   * Read ordinary bytes without copying or zero-initializing the read buffer.
+   * Returns null only when the descriptor reports EOF.
+   */
+  read(): Promise<Buffer | null>
+  /**
+   * Bytes still unwritten by the active write, including partial syscall
+   * progress. Null when no write is active; queued calls have not acquired
+   * the writer.
+   */
+  get pendingWriteBytes(): number | null
+  /**
+   * Write all bytes, awaiting readiness under backpressure. Cancellation or
+   * another error can leave a prefix written; no unwritten bytes are queued.
+   */
+  write(bytes: Buffer): Promise<void>
+  /**
+   * Idempotently cancel I/O and release the duplicate before resolving.
+   * Dropping this future after its first poll does not abandon cleanup.
+   */
+  close(): Promise<void>
+}
+
 /** One edit tool call's streaming session. */
 export declare class EditSession {
   /**

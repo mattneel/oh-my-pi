@@ -147,19 +147,23 @@ describe("launch without a terminal on stdin", () => {
 		expect(run.exitCode, run.stderr).toBe(1);
 	}, 30_000);
 
-	it("runs the prompt a boolean extension flag shadowing --mode leaves behind", async () => {
-		// Bootstrap reads `--mode compact` as an invalid built-in mode; with the
-		// extension's boolean `mode`, `compact` is the prompt.
-		using tempDir = TempDir.createSync("@omp-non-tty-ext-bool-");
-		const extensionPath = await writeFlagExtension(tempDir, "mode", "boolean");
-		const run = await launchWithoutTerminal(tempDir, ["-e", extensionPath, "--mode", "compact"]);
+	it.each(["mode", "tsp"])(
+		"runs the prompt a boolean extension flag shadowing --%s leaves behind",
+		async name => {
+			// Bootstrap consumes the prompt as an enum or optional transport value;
+			// the extension's boolean flag must recover it before the no-prompt guard.
+			using tempDir = TempDir.createSync("@omp-non-tty-ext-bool-");
+			const extensionPath = await writeFlagExtension(tempDir, name, "boolean");
+			const run = await launchWithoutTerminal(tempDir, ["-e", extensionPath, `--${name}`, "compact"]);
 
-		expect(run.stderr).not.toContain(TTY_ERROR);
-		expect(run.stderr).not.toContain("Invalid --mode value");
-		expect(run.stderr).toContain(NO_API_KEY);
-		expect(run.stderr).toContain("EXT_FLAG=true");
-		expect(run.exitCode, run.stderr).toBe(1);
-	}, 30_000);
+			expect(run.stderr).not.toContain(TTY_ERROR);
+			expect(run.stderr).not.toContain("Invalid --mode value");
+			expect(run.stderr).toContain(NO_API_KEY);
+			expect(run.stderr).toContain("EXT_FLAG=true");
+			expect(run.exitCode, run.stderr).toBe(1);
+		},
+		30_000,
+	);
 });
 
 describe("mode-dependent guards defer to flag-value errors", () => {

@@ -1,7 +1,13 @@
-import type { CommandMetadata } from "@oh-my-pi/pi-utils/cli";
+import { type CommandMetadata, Flags } from "@oh-my-pi/pi-utils/cli";
 
 export const acpHelp = {
 	description: "Run omp as an ACP (Agent Client Protocol) server over stdio",
+	flags: {
+		tsp: Flags.string({
+			description:
+				"Optional duplex Tern Surface Protocol presentation: --tsp [fd|socket] (default fd 3; Unix only; ACP process flag; stdio stays ACP)",
+		}),
+	},
 } satisfies CommandMetadata;
 
 export const agentsHelp = { description: "Manage bundled task agents" } satisfies CommandMetadata;

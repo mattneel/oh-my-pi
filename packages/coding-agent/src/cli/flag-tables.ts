@@ -61,18 +61,20 @@ export type OptionalSetter = (result: Args, value: string | undefined) => void;
 /**
  * Per-flag optional-value consumption policy.
  *
- * Every optional flag always rejects tokens that start with `-` — that shared
- * rule lives in the dispatch site. These booleans capture the *additional*
- * per-flag quirks:
+ * Optional flags reject spaced tokens that start with `-` — that shared rule
+ * lives in the dispatch site. These booleans capture the per-flag quirks:
  *
  * - `rejectEmpty`: treat `""` like “no value provided”. Needed for
  *   `--resume` / `-r` / `--session`. Without it, an empty string
  *   gets consumed as the session prefix and downstream resolution can match
  *   every session.
+ * - `allowExplicitFlagValue`: allow flag-looking values in `--flag=value`
+ *   form, where there is no ambiguity with a following option.
  */
 export interface OptionalFlagConfig {
 	set: OptionalSetter;
 	rejectEmpty?: boolean;
+	allowExplicitFlagValue?: boolean;
 }
 
 // Shared setters for flags that alias the same field.
@@ -89,6 +91,12 @@ const setResume: OptionalSetter = (result, value) => {
 const setRestore: OptionalSetter = (result, value) => {
 	setResume(result, value);
 	result.restore = true;
+};
+
+const setTsp: OptionalSetter = (result, value) => {
+	// Preserve the preliminary parse for extension flag ownership. Launch validation
+	// runs once the effective mode and (outside ACP) extension registry are known.
+	result.tsp = value === undefined ? 3 : /^[+-]?\d+$/.test(value) ? Number(value) : value;
 };
 
 const MAX_TIME_DURATION_RE = /^(\d+(?:\.\d+)?)([smh])$/;
@@ -268,15 +276,15 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 /**
  * Optional-value flags. Setters receive `undefined` for the bare form.
  *
- * The dispatch in `args.ts` applies the shared "doesn't start with `-`"
- * check for every flag, then consults the per-flag booleans below for the
- * remaining quirks.
+ * The dispatch in `args.ts` rejects spaced flag-looking values, then consults
+ * the per-flag policies below for empty strings and explicit equals values.
  */
 export const OPTIONAL_FLAGS: Record<string, OptionalFlagConfig> = {
 	"--resume": { set: setResume, rejectEmpty: true },
 	"-r": { set: setResume, rejectEmpty: true },
 	"--restore": { set: setRestore, rejectEmpty: true },
 	"--session": { set: setResume, rejectEmpty: true },
+	"--tsp": { set: setTsp, allowExplicitFlagValue: true },
 };
 
 /**

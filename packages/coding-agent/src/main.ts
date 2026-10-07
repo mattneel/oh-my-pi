@@ -35,6 +35,7 @@ import {
 	validateRestoreLaunch,
 	validateRestorePrompt,
 	validateToolNames,
+	validateTspLaunch,
 } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
@@ -79,6 +80,7 @@ import {
 } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
+import type { AcpModeOptions } from "./modes/acp/acp-mode";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import { formatSessionContinuationNotice } from "./modes/persistence-failure";
 import type { PrintModeOptions } from "./modes/print-mode";
@@ -203,7 +205,11 @@ import { cfgTaskAgentIdleTtlMs } from "./task/settings";
 import { cfgSkillsIncludeSkills } from "./extensibility/settings";
 import { cfgWorkspaceAdditionalDirectories } from "./session/context-settings";
 
-type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
+type RunAcpMode = (
+	createSession: AcpSessionFactory,
+	initialSession?: AgentSession,
+	options?: AcpModeOptions,
+) => Promise<void>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<number>;
 type RunRpcMode = (session: AgentSession, options?: RpcModeOptions) => Promise<never>;
 
@@ -610,17 +616,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			args.authStorage.keys.setRuntime(nextSession.model.provider, args.parsedArgs.apiKey);
 		}
 		const runner = nextSession.extensionRunner;
-		const reparsedArgs = applyExtensionFlags(
-			runner
-				? {
-						getFlags: () => runner.getFlags(),
-						setFlagValue: (name, value) => {
-							runner.setFlagValue(name, value);
-						},
-					}
-				: undefined,
-			args.rawArgs,
-		);
+		const reparsedArgs = applyExtensionFlags(runner, args.rawArgs, { processMode: "acp" });
 		const effectiveArgs = reparsedArgs ?? args.parsedArgs;
 		if (effectiveArgs.invalidFlagValues.length > 0) {
 			await nextSession.dispose();
@@ -1938,7 +1934,8 @@ export async function runRootCommand(
 			parsedArgs.messages.length === 0 &&
 			parsedArgs.fileArgs.length === 0 &&
 			parsedArgs.unrecognizedFlags.length === 0 &&
-			parsedArgs.invalidFlagValues.length === 0
+			parsedArgs.invalidFlagValues.length === 0 &&
+			parsedArgs.tsp === undefined
 		) {
 			exitWithoutTerminal();
 		}
@@ -2436,6 +2433,8 @@ export async function runRootCommand(
 		};
 
 		if (mode === "acp") {
+			// --tsp is a process-level ACP flag, not a per-session extension flag.
+			validateTspLaunch(parsedArgs, mode);
 			// ACP binds extensions per `session/new`, and any of them may own a flag
 			// the bootstrap parse rejected, so pending invalid enum values are
 			// normally settled by the per-session factory. With discovery off and no
@@ -2466,7 +2465,7 @@ export async function runRootCommand(
 			// Startup is over: stop recording spans, or every later session and subagent
 			// appends to the timing tree for the life of the server.
 			logger.endTiming();
-			await runAcpMode(createAcpSession);
+			await runAcpMode(createAcpSession, undefined, { tsp: parsedArgs.tsp });
 		} else {
 			// Resolve extension-registered CLI flags before creating the session so a
 			// bad `@file` fails fast WITHOUT leaving a junk session/breadcrumb
@@ -2505,6 +2504,7 @@ export async function runRootCommand(
 				},
 			};
 			const initialArgs = applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs;
+			validateTspLaunch(initialArgs, mode);
 			normalizeContinueSessionArgs(initialArgs, rawArgs);
 			try {
 				validateSessionPersistenceArgs(initialArgs);
