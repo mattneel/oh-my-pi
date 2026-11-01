@@ -1,0 +1,127 @@
+name: ACP TSP release
+
+# Publishes this fork's omp, upstream's release plus ACP TSP (`omp acp --tsp`),
+# as one Linux x64 binary for Clankyard's Sprites.
+#
+# To release: rebase `feat/acp-tsp` onto upstream's newest `v*` tag, then tag
+# its head `tsp-<omp version>-<n>` (n counts this fork's releases of that
+# version, from 1) and push both:
+#
+#    git tag -a tsp-18.15.0-1 -m "omp 18.15.0 with ACP TSP"
+#    git push origin feat/acp-tsp tsp-18.15.0-1
+#
+# Tags must not start with `v`: upstream's Nix workflow builds every `v*` tag.
+on:
+   push:
+      tags: ["tsp-*"]
+
+permissions:
+   contents: read
+
+jobs:
+   release:
+      name: Build and publish omp-linux-x64
+      # Upstream builds its Linux release binary on 22.04 as well.
+      runs-on: ubuntu-22.04
+      timeout-minutes: 90
+      permissions:
+         contents: write
+      env:
+         TAG: ${{ github.ref_name }}
+      steps:
+         - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+         - name: Check the tag names this version
+           id: version
+           shell: bash
+           run: |
+              set -euo pipefail
+              version="$(jq -r .version packages/coding-agent/package.json)"
+              if [[ ! "$TAG" =~ ^tsp-([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
+                echo "::error::Release tags are tsp-<version>-<n>, not $TAG"
+                exit 1
+              fi
+              if [ "${BASH_REMATCH[1]}" != "$version" ]; then
+                echo "::error::$TAG names ${BASH_REMATCH[1]}, but this commit is omp $version"
+                exit 1
+              fi
+              echo "version=$version" >> "$GITHUB_OUTPUT"
+         # The binary embeds the Bun that compiles it: the version upstream's
+         # release_binary job pins.
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+           with:
+              bun-version: 1.4.4
+         - run: bun install --frozen-lockfile
+         # The build tools upstream's Docker image installs for the same build.
+         - name: Install native build tools
+           run: |
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends clang libclang-dev cmake ninja-build pkg-config libssl-dev
+         - name: Install the pinned Rust toolchain
+           run: rustup toolchain install
+         # Cargo builds the addon for this host, as upstream's Docker image
+         # does: x86-64-v3 (modern) on an AVX2 runner, else baseline. Sprites
+         # load either. The build dlopen-probes the addon before it returns.
+         - name: Build the native addon
+           env:
+              OMP_NATIVE_BUILD_BACKEND: cargo
+              OMP_NATIVE_CARGO_PROFILE: ci
+           run: bun run build:native
+         - name: Test what this fork changes
+           run: >
+              bun test
+              packages/coding-agent/test/acp-tsp.test.ts
+              packages/coding-agent/test/acp-tsp-presentation.test.ts
+              packages/coding-agent/test/cli-tsp-flag.test.ts
+              packages/coding-agent/test/cli-non-tty-launch.test.ts
+              packages/tui/test/native/encode.test.ts
+              packages/tui/test/native/transcript-native.test.ts
+              packages/tui/test/native/transport.test.ts
+         - name: Build the release binary
+           env:
+              RELEASE_TARGETS: linux-x64
+           run: bun run ci:release:build-binaries
+         - name: Smoke the release binary
+           shell: bash
+           env:
+              BINARY: packages/coding-agent/binaries/omp-linux-x64
+              VERSION: ${{ steps.version.outputs.version }}
+           run: |
+              set -euo pipefail
+              runtime_dir="$(mktemp -d)"
+              export HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg"
+              reported="$("$BINARY" --version)"
+              if [ "$reported" != "omp/$VERSION" ]; then
+                echo "::error::The binary reports $reported, not omp/$VERSION"
+                exit 1
+              fi
+              "$BINARY" --smoke-test
+              help="$("$BINARY" acp --help)"
+              if [[ "$help" != *--tsp* ]]; then
+                echo "::error::omp acp --help does not list --tsp"
+                exit 1
+              fi
+         - name: Publish the release
+           shell: bash
+           env:
+              GH_TOKEN: ${{ github.token }}
+              VERSION: ${{ steps.version.outputs.version }}
+           run: |
+              set -euo pipefail
+              addons=(packages/natives/native/pi_natives.linux-x64-*.node)
+              cd packages/coding-agent/binaries
+              sha256sum omp-linux-x64 > SHA256SUMS.txt
+              cat > "$RUNNER_TEMP/notes.md" <<EOF
+              omp $VERSION from upstream, plus ACP TSP: \`omp acp --tsp [fd|socket]\`
+              presents the session over the Tern Surface Protocol on a duplex side
+              channel while stdio stays ACP.
+
+              Linux x64 only, for Clankyard's Sprites. Native addon: ${addons[*]##*/}.
+
+              Commit: $GITHUB_SHA
+              SHA-256 of omp-linux-x64: $(cut -d' ' -f1 SHA256SUMS.txt)
+              EOF
+              gh release create "$TAG" omp-linux-x64 SHA256SUMS.txt \
+                --repo "$GITHUB_REPOSITORY" \
+                --verify-tag \
+                --title "omp $VERSION with ACP TSP ($TAG)" \
+                --notes-file "$RUNNER_TEMP/notes.md"
