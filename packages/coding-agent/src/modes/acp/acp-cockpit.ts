@@ -13,6 +13,7 @@ import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line/component";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { Component } from "@oh-my-pi/pi-tui/tui";
 import { logger } from "@oh-my-pi/pi-utils";
+import { showGitOverlay } from "../../cli/git-tui";
 import { cfgCycleOrder } from "../../config/model-settings";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { registerPersistedSubagents, sessionFileBelongsToRoot } from "../../registry/persisted-agents";
@@ -25,6 +26,7 @@ import { applySessionModel } from "../session-model-switch";
 import { createStatusLineHost, type StatusLineHostSession } from "../status-line-host";
 import { AcpViewerHost } from "./acp-viewer-host";
 import { getAcpInteractionProjection } from "./acp-interactions";
+import { openAcpContext, openAcpUsage } from "./acp-status-overlays";
 
 export interface AcpPresentationRuntime {
 	eventBus?: EventBusLike;
@@ -54,7 +56,10 @@ export class AcpCockpit implements Component {
 		readonly transport: TspTransport,
 		readonly requestRender: () => void,
 	) {
-		this.#status = new StatusLineComponent<StatusLineHostSession>(session, createStatusLineHost(session.settings));
+		this.#status = new StatusLineComponent<StatusLineHostSession>(session, {
+			...createStatusLineHost(session.settings),
+			getProjectDir: () => session.sessionManager.getCwd(),
+		});
 		this.#status.watchBranch(requestRender);
 		const sessionFile = session.sessionManager.getSessionFile();
 		this.#observers.setMainSession(sessionFile);
@@ -173,15 +178,35 @@ export class AcpCockpit implements Component {
 	handleNativeEvent(event: NativeUiEvent): void {
 		// Stop, approvals and question answers are intercepted by the host and completed over ACP.
 		if (this.#disposed || event.type !== "action" || !event.viewer) return;
-		if (event.act !== "model" && event.act !== "effort" && event.act !== "agents") return;
+		const action = event.act === "status.model" ? "model" : event.act;
+		// status.path deliberately belongs to Clankyard's Files pane, not this browser-less session.
+		if (
+			action !== "model" &&
+			action !== "effort" &&
+			action !== "agents" &&
+			action !== "status.context" &&
+			action !== "status.cost" &&
+			action !== "status.git"
+		)
+			return;
 		this.viewerLeft(event.viewer);
 		const viewer = new AcpViewerHost(this.transport, this.backend, event.viewer, this.requestRender);
 		this.#viewers.set(event.viewer, viewer);
 		const done = () => {
 			if (this.#viewers.get(event.viewer!) === viewer) this.viewerLeft(event.viewer!);
 		};
-		if (event.act === "model") this.#modelPicker(viewer, done);
-		else if (event.act === "effort") {
+		if (action === "status.context") openAcpContext(viewer, this.session, done);
+		else if (action === "status.cost") {
+			void openAcpUsage(viewer, this.session, done).catch(error => {
+				logger.warn("ACP usage overlay failed", { error: String(error) });
+				done();
+			});
+		} else if (action === "status.git") {
+			void showGitOverlay(viewer, { cwd: this.session.sessionManager.getCwd() })
+				.catch(error => logger.warn("ACP git overlay failed", { error: String(error) }))
+				.finally(done);
+		} else if (action === "model") this.#modelPicker(viewer, done);
+		else if (action === "effort") {
 			viewer.mount(
 				new ThinkingSelectorComponent(
 					this.session.configuredThinkingLevel(),

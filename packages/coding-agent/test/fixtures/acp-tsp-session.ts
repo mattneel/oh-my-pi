@@ -5,6 +5,7 @@ import { ONE_PIXEL_PNG } from "../helpers/skill-image-vision";
 // No provider, model request, extension, or terminal is needed to write a journal.
 const session = SessionManager.create(process.cwd());
 const imageCount = Number(process.argv[2] ?? 1);
+const statusUsage = process.argv[3] === "status";
 const png = Buffer.from(ONE_PIXEL_PNG, "base64");
 session.appendMessage({ role: "user", content: "Find the saved surface fixture", timestamp: 1 });
 session.appendMessage({
@@ -12,6 +13,9 @@ session.appendMessage({
 	content: [
 		{ type: "text", text: "Saved assistant transcript" },
 		{ type: "toolCall", id: "surface-lookup", name: "lookup_thing", arguments: { q: "surface fixture" } },
+		...(statusUsage
+			? [{ type: "toolCall" as const, id: "surface-status", name: "inspect_status", arguments: {} }]
+			: []),
 	],
 	api: "anthropic-messages",
 	provider: "acp-fixture",
@@ -46,6 +50,33 @@ session.appendMessage({
 	isError: false,
 	timestamp: 3,
 });
+if (statusUsage) {
+	session.appendMessage({
+		role: "toolResult",
+		toolCallId: "surface-status",
+		toolName: "inspect_status",
+		content: [{ type: "text", text: "Status inspection from the saved session's second tool." }],
+		isError: false,
+		timestamp: 4,
+	});
+	session.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "Saved status overlay usage" }],
+		api: "anthropic-messages",
+		provider: "acp-fixture",
+		model: "transcript",
+		stopReason: "stop",
+		usage: {
+			input: 1024,
+			output: 64,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 1088,
+			cost: { input: 0.1, output: 0.025, cacheRead: 0, cacheWrite: 0, total: 0.125 },
+		},
+		timestamp: 5,
+	});
+}
 await session.ensureOnDisk();
 await session.flush();
 await session.close();

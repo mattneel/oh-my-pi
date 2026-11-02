@@ -311,13 +311,23 @@ created in ACP mode.
 
 With `viewers`, the shared `omp.session` surface contains the transcript and a
 dock with model, effort, context, cost, Agents and the running turn's Stop
-control. Model/effort pickers and the live Agents hub open per-window inline
-surfaces with role `omp.viewer`, a `viewer` audience and IDs
+control. Model/effort pickers, Context, Usage, Git and the live Agents hub open
+per-window inline surfaces with role `omp.viewer`, a `viewer` audience and IDs
 `v.<viewer>.<n>`. The hub's transcript is read-only; opening it does not switch
 the shared conversation. The host assigns viewer identities, routes each viewer
 surface only to its audience, and injects `viewer` on input events. A departure
 event `{ev:"viewer",viewer,present:false}` disposes that window's UI.
 An event cannot address another viewer's surface.
+
+The context meter's `status.context` action opens the same read-only Context
+viewer as `/context`, including used/remaining tokens, the stacked meter,
+category navigation, per-tool output, Auto-Compact Buffer and Free Space.
+`status.cost` opens the native Usage dashboard, including account gaps and daily
+activity, and `status.git` opens the native Git app for that session's
+working directory. Each has its own Close/Escape controls and never replaces
+another window's UI or the shared transcript. `status.model` aliases the model
+chip's temporary session model switch. `status.path` is deliberately unhandled
+by omp: browser hosts can map it to their Files pane.
 
 When both `viewers` and `keys` are negotiated, a host can send
 `{ev:"key",sf,viewer,data}` to the viewer surface's focused component; `data`

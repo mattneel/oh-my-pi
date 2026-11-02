@@ -33,12 +33,13 @@ import { SplitPane } from "../../components/layout/split-pane";
 import { Stack } from "../../components/layout/stack";
 import { matchesKey } from "../../keys";
 import { ProcessTerminal } from "../../terminal";
+import type { ImageBudget } from "../../components/image";
 import { routeSgrMouseInput } from "../../mouse";
 import { col, compact, keyed, node, row, span, stableKey, text } from "../../native/describe";
 import { Memo } from "../../native/memo";
 import type { DescribeContext, NativeNode, NativeUiEvent } from "../../native/node";
 import { actionButton, iconButton, segmentedTabs } from "../../native/overlay";
-import { type Component, type OverlayHandle, TUI } from "../../tui";
+import { type Component, type OverlayHandle, type OverlayOptions, TUI } from "../../tui";
 import { truncateToWidth, visibleWidth } from "../../utils";
 import { theme, warmHighlighter } from "../../theme/theme";
 import type { AvatarSource } from "./avatar";
@@ -84,6 +85,16 @@ export interface GitTuiHost {
 		signal?: AbortSignal;
 		onProgress?: (message: string) => void;
 	}): Promise<{ commit: GitCommitMessage; validationError?: string | null; stagedAll: boolean }>;
+}
+
+/** Rendering and lifetime capabilities shared by terminal and viewer-scoped hosts. */
+export interface GitOverlayHost {
+	readonly imageBudget: ImageBudget;
+	readonly terminal: { readonly columns: number; readonly rows?: number };
+	readonly signal?: AbortSignal;
+	requestRender(): void;
+	setFocus(component: Component | null): void;
+	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle;
 }
 
 const REFRESH_MS = 2_000;
@@ -178,7 +189,7 @@ function chip(label: string, active: boolean): string {
 }
 
 class GitTuiComponent implements Component {
-	readonly #ui: TUI;
+	readonly #ui: GitOverlayHost;
 	readonly #model: GitTuiModel;
 	readonly #host: GitTuiHost;
 	readonly #pane: DiffPane;
@@ -215,7 +226,7 @@ class GitTuiComponent implements Component {
 	readonly #nativeBody = new Memo();
 	readonly #nativeRoot = new Memo();
 
-	constructor(ui: TUI, host: GitTuiHost) {
+	constructor(ui: GitOverlayHost, host: GitTuiHost) {
 		this.#ui = ui;
 		this.#host = host;
 		this.#model = host.model;
@@ -247,6 +258,7 @@ class GitTuiComponent implements Component {
 
 	async run(): Promise<void> {
 		await this.#refresh(true);
+		if (this.#disposed) return;
 		this.#refreshTimer = setInterval(() => void this.#refresh(false), REFRESH_MS);
 		return this.#done.promise;
 	}
@@ -254,6 +266,7 @@ class GitTuiComponent implements Component {
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		this.#done.resolve();
 		this.#loadAbort?.abort();
 		this.#highlightAbort?.abort();
 		this.#generationAbort?.abort();
@@ -270,11 +283,11 @@ class GitTuiComponent implements Component {
 		if (this.#disposed) return;
 		try {
 			const changed = await this.#model.refresh();
-			if (!changed && !force) return;
+			if (this.#disposed || (!changed && !force)) return;
 			this.#syncSidebar(true);
 			this.#loadDeferredDetails();
 		} catch (error) {
-			this.#setError(error);
+			if (!this.#disposed) this.#setError(error);
 		}
 	}
 
@@ -775,7 +788,7 @@ class GitTuiComponent implements Component {
 	// ── render ─────────────────────────────────────────────────────────────
 
 	render(width: number): readonly string[] {
-		const height = Math.max(10, this.#ui.terminal.rows);
+		const height = Math.max(10, this.#ui.terminal.rows ?? 40);
 		const sidebarWidth = Math.max(30, Math.min(48, Math.floor(width * 0.3)));
 		this.#centerWidth = width - sidebarWidth - 1;
 		const contentHeight = height - 2;
@@ -1273,7 +1286,8 @@ function assetText(asset: AssetFileContents["old"]): TspSpan[] {
  * Mount the git TUI as a fullscreen overlay on an existing TUI (the `/git`
  * slash command). Resolves when the user closes it; the caller restores focus.
  */
-export async function showGitOverlay(ui: TUI, host: GitTuiHost): Promise<void> {
+export async function showGitOverlay(ui: GitOverlayHost, host: GitTuiHost): Promise<void> {
+	if (ui.signal?.aborted) return;
 	const component = new GitTuiComponent(ui, host);
 	const overlay = ui.showOverlay(component, {
 		anchor: "top-left",
@@ -1285,9 +1299,12 @@ export async function showGitOverlay(ui: TUI, host: GitTuiHost): Promise<void> {
 	});
 	ui.setFocus(component);
 	ui.requestRender();
+	const abort = () => component.dispose();
+	ui.signal?.addEventListener("abort", abort, { once: true });
 	try {
 		await component.run();
 	} finally {
+		ui.signal?.removeEventListener("abort", abort);
 		component.dispose();
 		// overlay.hide() restores focus to the pre-overlay component.
 		overlay.hide();

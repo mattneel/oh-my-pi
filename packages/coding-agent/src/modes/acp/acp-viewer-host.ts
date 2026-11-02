@@ -21,6 +21,7 @@ export class AcpViewerHost implements NativeHost, AgentHubHost {
 	#overlays: ViewerOverlay[] = [];
 	#closed = false;
 	#notice: string | undefined;
+	readonly #lifetime = new AbortController();
 
 	constructor(
 		readonly terminal: TspTransport,
@@ -34,6 +35,10 @@ export class AcpViewerHost implements NativeHost, AgentHubHost {
 
 	get closed(): boolean {
 		return this.#closed;
+	}
+
+	get signal(): AbortSignal {
+		return this.#lifetime.signal;
 	}
 
 	mount(component: Component): void {
@@ -115,6 +120,7 @@ export class AcpViewerHost implements NativeHost, AgentHubHost {
 	dispose(): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#lifetime.abort();
 		// The hub owns its nested transcript's timers and disposal.
 		this.#root?.dispose?.();
 		this.#root = undefined;

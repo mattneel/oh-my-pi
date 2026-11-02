@@ -41,6 +41,7 @@
 - Native TSP presentation supports dedicated duplex connections and live transcript updates without an interactive terminal.
 - Added negotiated viewer-scoped native surfaces and key routing, tool approval projections and question forms for ACP cockpits.
 - Transcript builders can opt into durable wire keys, explicit Yard context sections and complete tool bodies independent of local folds.
+- The Git app accepts a portable rendering/lifetime host, allowing viewer-scoped native pages without constructing an interactive terminal.
 
 ### Fixed
 
