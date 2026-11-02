@@ -209,16 +209,17 @@ export class RpcConnection {
 		const id = this.#nextId++;
 		const deferred = Promise.withResolvers<unknown>();
 		this.#pending.set(id, deferred);
-		void this.#write({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) }).catch(error => {
-			this.#pending.delete(id);
-			deferred.reject(error);
-		});
+		void this.#write({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) });
 		return { id, deferred };
 	}
 
-	/** Sends a JSON-RPC notification. */
-	async notify(method: string, params?: unknown): Promise<void> {
-		await this.#write({ jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) });
+	/**
+	 * Sends a best-effort JSON-RPC notification. A disconnected peer cannot
+	 * receive it; write failures close the connection and reject pending
+	 * requests instead of rejecting an unobserved one-way delivery.
+	 */
+	notify(method: string, params?: unknown): Promise<void> {
+		return this.#write({ jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) });
 	}
 
 	/** Closes the connection and rejects outstanding requests. */
@@ -231,16 +232,24 @@ export class RpcConnection {
 	}
 
 	#write(message: AnyMessage): Promise<void> {
-		const write = this.#writeTail.then(async () => {
-			const writer = this.#writable.getWriter();
+		if (this.signal.aborted) return Promise.resolve();
+		this.#writeTail = this.#writeTail.then(async () => {
+			// Closing can race an already queued response or notification.
+			if (this.signal.aborted) return;
 			try {
-				await writer.write(message);
-			} finally {
-				writer.releaseLock();
+				const writer = this.#writable.getWriter();
+				try {
+					await writer.write(message);
+				} finally {
+					writer.releaseLock();
+				}
+			} catch (error) {
+				// The connection lifetime is the failure channel for one-way
+				// writes. Correlated requests are rejected by close(error).
+				this.close(error);
 			}
 		});
-		this.#writeTail = write.catch(() => {});
-		return write;
+		return this.#writeTail;
 	}
 
 	async #read(readable: ReadableStream<AnyMessage>): Promise<void> {

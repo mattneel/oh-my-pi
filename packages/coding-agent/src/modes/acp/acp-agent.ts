@@ -391,6 +391,8 @@ type ManagedSessionRecord = {
 	// after the bootstrap guard or a client prompt proves the session is known.
 	lifetimeUnsubscribe: (() => void) | undefined;
 	commandMetadataUnsubscribe: (() => void) | undefined;
+	bootstrapTimer: NodeJS.Timeout | undefined;
+	bootstrapUpdates: Promise<void> | undefined;
 	lifetimeUpdatesReady: boolean;
 	pendingCompactionNotifications: AcpCompactionNotification[] | undefined;
 	closedError: RequestError | undefined;
@@ -1860,6 +1862,8 @@ export class AcpAgent implements Agent {
 			extensionUserMessageTasks: new Set(),
 			lifetimeUnsubscribe: undefined,
 			commandMetadataUnsubscribe: undefined,
+			bootstrapTimer: undefined,
+			bootstrapUpdates: undefined,
 			lifetimeUpdatesReady: false,
 			pendingCompactionNotifications: undefined,
 		};
@@ -2685,14 +2689,11 @@ export class AcpAgent implements Agent {
 		// this guard are represented in the response's snapshot; compaction
 		// transitions are buffered because no snapshot can reconstruct them.
 		// A prompt can open delivery sooner: it proves the client knows the id.
-		setTimeout(() => {
-			if (this.#connection.signal.aborted) {
-				return;
-			}
-			const record = this.#sessions.get(sessionId);
-			if (!record) {
-				return;
-			}
+		const record = this.#sessions.get(sessionId);
+		if (!record) return;
+		record.bootstrapTimer = setTimeout(() => {
+			record.bootstrapTimer = undefined;
+			if (this.#connection.signal.aborted || this.#sessions.get(sessionId) !== record) return;
 			this.#activateLifetimeUpdates(record);
 			if (!record.commandMetadataUnsubscribe) {
 				record.commandMetadataUnsubscribe = record.session.subscribeCommandMetadataChanged(() => {
@@ -2701,7 +2702,9 @@ export class AcpAgent implements Agent {
 					});
 				});
 			}
-			void this.#emitBootstrapUpdates(sessionId, record);
+			record.bootstrapUpdates = this.#emitBootstrapUpdates(sessionId, record).catch(error => {
+				logger.warn("Failed to emit ACP bootstrap updates", { error: String(error) });
+			});
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
 	}
 
@@ -2727,13 +2730,16 @@ export class AcpAgent implements Agent {
 				},
 			});
 		}
+		const availableCommands = await this.#buildAvailableCommands(record.session);
+		if (this.#connection.signal.aborted || this.#sessions.get(sessionId) !== record) return;
 		await this.#connection.sessionUpdate({
 			sessionId,
 			update: {
 				sessionUpdate: "available_commands_update",
-				availableCommands: await this.#buildAvailableCommands(record.session),
+				availableCommands,
 			},
 		});
+		if (this.#connection.signal.aborted || this.#sessions.get(sessionId) !== record) return;
 		await this.#connection.sessionUpdate({
 			sessionId,
 			update: {
@@ -3399,6 +3405,9 @@ export class AcpAgent implements Agent {
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
 		record.commandMetadataUnsubscribe?.();
+		clearTimeout(record.bootstrapTimer);
+		record.bootstrapTimer = undefined;
+		await record.bootstrapUpdates;
 		record.pendingCompactionNotifications = undefined;
 		this.#presentation?.removeSession(record.session);
 		if (record.mcpManager) {

@@ -1047,6 +1047,52 @@ describe("ACP agent", () => {
 		]);
 	});
 
+	it("awaits an in-flight bootstrap notification before disposing its session", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			sessionUpdateHook: async notification => {
+				if (notification.update.sessionUpdate !== "available_commands_update") return;
+				started.resolve();
+				await release.promise;
+			},
+		});
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		try {
+			await started.promise;
+			let disposed = false;
+			const disposal = harness.agent.dispose().then(() => {
+				disposed = true;
+			});
+			await Promise.resolve();
+			expect(disposed).toBe(false);
+			expect(session.disposed).toBe(false);
+			release.resolve();
+			await disposal;
+			expect(session.disposed).toBe(true);
+			expect(
+				harness.updates.filter(notification => notification.update.sessionUpdate === "available_commands_update"),
+			).toHaveLength(1);
+			expect(
+				harness.updates.filter(notification => notification.update.sessionUpdate === "session_info_update"),
+			).toEqual([]);
+		} finally {
+			release.resolve();
+			await harness.agent.dispose();
+		}
+	});
+
+	it("cancels a session's bootstrap timer when disposed before its guard", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		await harness.agent.dispose();
+		await advanceBootstrapGuard();
+		expect(harness.findSession(created.sessionId)?.disposed).toBe(true);
+		expect(harness.updates).toEqual([]);
+	});
+
 	it("pushes config_option_update when thinking level changes internally", async () => {
 		// Internal callers (slash commands, model auto-adjust, extension UI) call
 		// AgentSession.setThinkingLevel directly without going through the ACP

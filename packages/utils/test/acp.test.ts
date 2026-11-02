@@ -163,6 +163,71 @@ describe("ACP JSON-RPC transport", () => {
 		hold.resolve();
 	});
 
+	it("drops queued and late notifications once the connection closes", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const messages: AnyMessage[] = [];
+		const writable = new WritableStream<AnyMessage>({
+			write(message) {
+				messages.push(message);
+			},
+		});
+		const connection = new RpcConnection({ writable, readable: inbound.readable }, () => undefined);
+		const queued = connection.notify("queued");
+		connection.close();
+		const late = connection.notify("late");
+		await Promise.all([queued, late]);
+		expect(messages).toEqual([]);
+		await inbound.writable.close();
+		await writable.close();
+	});
+
+	it("closes on a failed notification write and rejects pending requests without rejecting the notification", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const failure = new Error("outbound stream closed");
+		let writes = 0;
+		const writable = new WritableStream<AnyMessage>({
+			write() {
+				writes++;
+				throw failure;
+			},
+		});
+		const connection = new RpcConnection({ writable, readable: inbound.readable }, () => undefined);
+		const notification = connection.notify("event");
+		const request = connection.request("pending");
+		const rejected = expect(request).rejects.toBe(failure);
+		await notification;
+		await rejected;
+		await connection.closed;
+		expect(connection.signal.reason).toBe(failure);
+		expect(writes).toBe(1);
+		await expect(connection.request("after-close")).rejects.toThrow("Connection closed");
+		await inbound.writable.close();
+	});
+
+	it("lets an accepted write settle while dropping writes queued behind it at close", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const messages: AnyMessage[] = [];
+		const writable = new WritableStream<AnyMessage>({
+			async write(message) {
+				messages.push(message);
+				started.resolve();
+				await release.promise;
+			},
+		});
+		const connection = new RpcConnection({ writable, readable: inbound.readable }, () => undefined);
+		const accepted = connection.notify("accepted");
+		await started.promise;
+		const queued = connection.notify("queued");
+		connection.close();
+		release.resolve();
+		await Promise.all([accepted, queued]);
+		expect(messages).toEqual([{ jsonrpc: "2.0", method: "accepted" }]);
+		await inbound.writable.close();
+		await writable.close();
+	});
+
 	it("matches the SDK error-code fixtures", () => {
 		expect([
 			RequestError.parseError().toErrorResponse(),
