@@ -93,6 +93,8 @@ export interface NativeHost {
 	motionChanged(reduce: boolean): void;
 	/** Theme-derived output changed (symbol preset): drop render and describe caches. */
 	invalidate(): void;
+	/** A trusted host reports a browser window leaving (viewer extension only). */
+	viewerLeft?(viewer: string): void;
 }
 
 export interface NativeBackendOptions {
@@ -211,7 +213,7 @@ function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
  * raw JSON values Tern draws as its own tree; `button`: omp's buttons, which
  * older builds get as role-styled rows).
  */
-const UNASSUMED_KINDS: Partial<Record<TspKind, true>> = { media: true, json: true, button: true };
+const UNASSUMED_KINDS: Partial<Record<TspKind, true>> = { media: true, json: true, button: true, questions: true };
 
 /**
  * The reply a v1 terminal is assumed to give before its real `hello` arrives
@@ -306,12 +308,13 @@ export class NativeBackend {
 	#inline: Surface;
 	#screen: Surface | null = null;
 	#nextSurface = 1;
+	#viewers = new Map<string, { surface: Surface; viewer: string; host: NativeHost }>();
 	#mirror: boolean;
 	#recordPath: string | undefined;
 	#stats: boolean;
 	#scheduler: RenderScheduler;
 	/** Wakes a render when the oldest unacked frame of a credit-blocked surface turns stalled. */
-	#stallTimer: RenderTimer | undefined;
+	#stallTimers = new Map<string, RenderTimer>();
 	#recent: TspFrame[] = [];
 	#sawResize = false;
 	#live = false;
@@ -370,6 +373,26 @@ export class NativeBackend {
 		this.render();
 	}
 
+	/** Open a window-local document without suspending the shared transcript. */
+	openViewer(viewer: string, host: NativeHost): string {
+		if (!this.#live || !this.#cx.feature("viewers") || !viewer) {
+			throw new Error("Viewer surfaces require a live, viewer-capable host");
+		}
+		const surface = new Surface(`v.${viewer}.${this.#nextSurface++}`, "inline", "omp.viewer", this.#mirror);
+		this.#viewers.set(surface.id, { surface, viewer, host });
+		this.#write("o", { id: surface.id, mode: surface.mode, title: "omp", role: surface.role, viewer });
+		this.#host.requestRender();
+		return surface.id;
+	}
+
+	closeViewerSurface(sf: string): void {
+		const entry = this.#viewers.get(sf);
+		if (!entry) return;
+		this.#viewers.delete(sf);
+		this.#close(entry.surface, false);
+		entry.surface.doc?.close();
+	}
+
 	/**
 	 * Tern's font carries every Nerd Font glyph, and it never answers the Glyph
 	 * Protocol, so icons come from the nerd preset (process-local, not the
@@ -389,6 +412,7 @@ export class NativeBackend {
 		this.#live = false;
 		if (this.#screen) this.#close(this.#screen, false);
 		this.#screen = null;
+		for (const sf of this.#viewers.keys()) this.closeViewerSurface(sf);
 		this.#close(this.#inline, keep);
 		this.#inline.doc?.close();
 		setNativeRendering(false);
@@ -503,14 +527,27 @@ export class NativeBackend {
 			layer = overlays.map(overlay => this.#overlayNode(overlay));
 		}
 		this.#pruneOverlayNodes(overlays);
+		this.#renderSurface(surface, { main, dock }, layer, this.#host);
+		for (const { surface: viewerSurface, host } of this.#viewers.values()) {
+			const viewerOverlays = host.overlays();
+			this.#renderSurface(
+				viewerSurface,
+				host.describeSurface(this.#cx),
+				viewerOverlays.map(overlay => this.#overlayNode(overlay)),
+				host,
+			);
+		}
+	}
+
+	#renderSurface(surface: Surface, described: NativeSurface, layer: readonly NativeChild[], host: NativeHost): void {
 		if (!this.#hasCredit(surface)) {
 			surface.dirty = true;
 			this.#armStallTimer(surface);
 			return;
 		}
 		surface.dirty = false;
-		const ops = surface.reconciler.reconcile({ main, dock, layer }, this.#cx);
-		const focused = this.#host.focused();
+		const ops = surface.reconciler.reconcile({ main: described.main, dock: described.dock, layer }, this.#cx);
+		const focused = host.focused();
 		const focus = focused ? surface.reconciler.focusTarget(focused) : null;
 		if (focus !== surface.focus) {
 			ops.push(["focus", focus]);
@@ -566,6 +603,7 @@ export class NativeBackend {
 	}
 
 	#close(surface: Surface, keep: boolean): void {
+		this.#clearStallTimer(surface);
 		this.#write("x", { id: surface.id, keep });
 	}
 
@@ -590,20 +628,28 @@ export class NativeBackend {
 
 	/** Render again once `surface`'s oldest unacked frame counts as stalled, in case no ack ever arrives. */
 	#armStallTimer(surface: Surface): void {
-		if (this.#stallTimer) return;
+		if (this.#stallTimers.has(surface.id)) return;
 		const delay = surface.unacked[0]! + STALLED_ACK_MS - this.#scheduler.now();
-		this.#stallTimer = this.#scheduler.scheduleRender(
-			() => {
-				this.#stallTimer = undefined;
-				this.#host.requestRender();
-			},
-			Math.max(0, delay),
+		this.#stallTimers.set(
+			surface.id,
+			this.#scheduler.scheduleRender(
+				() => {
+					this.#stallTimers.delete(surface.id);
+					this.#host.requestRender();
+				},
+				Math.max(0, delay),
+			),
 		);
 	}
 
-	#clearStallTimer(): void {
-		this.#stallTimer?.cancel();
-		this.#stallTimer = undefined;
+	#clearStallTimer(surface?: Surface): void {
+		if (surface) {
+			this.#stallTimers.get(surface.id)?.cancel();
+			this.#stallTimers.delete(surface.id);
+			return;
+		}
+		for (const timer of this.#stallTimers.values()) timer.cancel();
+		this.#stallTimers.clear();
 	}
 
 	#sendFrame(surface: Surface, ops: readonly TspOp[]): void {
@@ -756,11 +802,31 @@ export class NativeBackend {
 
 	#surfaceFor(sf: string | undefined): Surface | null {
 		if (sf === undefined || sf === this.#inline.id) return this.#inline;
-		return this.#screen?.id === sf ? this.#screen : null;
+		return this.#viewers.get(sf)?.surface ?? (this.#screen?.id === sf ? this.#screen : null);
 	}
 
 	#handleEvent(event: TspEvent): void {
+		// ACKs belong to the authoritative document host, not a browser window.
+		// Every window-originated event must match the audience of its surface.
+		const sf = "sf" in event ? event.sf : undefined;
+		const viewerSurface = sf === undefined ? undefined : this.#viewers.get(sf);
+		if (viewerSurface && (event.ev !== "ack" || event.viewer !== undefined) && event.viewer !== viewerSurface.viewer)
+			return;
+		if (event.viewer !== undefined && !this.#cx.feature("viewers")) return;
 		switch (event.ev) {
+			case "viewer":
+				if (!this.#cx.feature("viewers") || event.present) return;
+				for (const [id, entry] of this.#viewers) {
+					if (entry.viewer === event.viewer) this.closeViewerSurface(id);
+				}
+				this.#host.viewerLeft?.(event.viewer);
+				return;
+			case "key":
+				if (!this.#cx.feature("viewers") || !this.#cx.feature("keys") || !viewerSurface) return;
+				if (Buffer.byteLength(event.data, "utf8") > 4096) return;
+				viewerSurface.host.focused()?.handleInput?.(event.data);
+				this.#host.requestRender();
+				return;
 			case "ack": {
 				const surface = this.#surfaceFor(event.sf);
 				if (!surface || event.s <= surface.acked) return;
@@ -776,7 +842,7 @@ export class NativeBackend {
 					surface.stalledSince = undefined;
 					surface.stallResets = 0;
 				}
-				this.#clearStallTimer();
+				this.#clearStallTimer(surface);
 				if (surface.dirty) this.#host.requestRender();
 				return;
 			}
@@ -827,7 +893,11 @@ export class NativeBackend {
 				if (!reconciler || owners.length === 0) return;
 				const field =
 					owners.findLast(owner => owner.handleInput && reconciler.focusTarget(owner) === event.id) ?? null;
-				this.#host.focusFromPointer(owners, field, overlay => overlay.nativeSheet?.(this.#cx) === true);
+				(viewerSurface?.host ?? this.#host).focusFromPointer(
+					owners,
+					field,
+					overlay => overlay.nativeSheet?.(this.#cx) === true,
+				);
 				this.#host.requestRender();
 				return;
 			}
@@ -865,10 +935,18 @@ export class NativeBackend {
 				ui = { type: "activate", key: target.keypath, item: item(event.item) };
 				break;
 			case "action":
-				ui = { type: "action", key: target.keypath, act: event.act, value: event.value, mods: event.mods ?? [] };
+				ui = {
+					type: "action",
+					key: target.keypath,
+					act: event.act,
+					value: event.value,
+					item: event.item,
+					values: event.values,
+					mods: event.mods ?? [],
+				};
 				break;
 			case "change":
-				ui = { type: "change", key: target.keypath, item: event.item, value: event.value };
+				ui = { type: "change", key: target.keypath, item: event.item, value: event.value, values: event.values };
 				break;
 			case "edit": {
 				const { from, to, text, cursor, len } = event;
@@ -882,6 +960,7 @@ export class NativeBackend {
 				ui = { type: "send", key: target.keypath, text: event.text };
 				break;
 		}
+		if (event.viewer !== undefined) ui = { ...ui, viewer: event.viewer };
 		target.component.handleNativeEvent(ui);
 		this.#host.requestRender();
 	}
@@ -917,8 +996,10 @@ export class NativeBackend {
 	}
 
 	#pruneOverlayNodes(overlays: readonly NativeOverlay[]): void {
-		if (this.#overlayNodes.size <= overlays.length) return;
 		const live = new Set(overlays.map(overlay => overlay.component));
+		for (const { host } of this.#viewers.values()) {
+			for (const overlay of host.overlays()) live.add(overlay.component);
+		}
 		for (const component of this.#overlayNodes.keys()) if (!live.has(component)) this.#overlayNodes.delete(component);
 	}
 }

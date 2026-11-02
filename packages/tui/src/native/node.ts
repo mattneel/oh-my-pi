@@ -14,7 +14,7 @@
  * the Tern SDK's Surface Protocol reference (`docs/sdk/src/protocol` in the
  * Stencil repository, https://docs.stencil.so/tern/protocol/) for the spec.
  */
-import type { TspEvent, TspKind, TspProps, TspScrollBy, TspSpan } from "@oh-my-pi/pi-wire";
+import type { TspEvent, TspEventValue, TspKind, TspProps, TspScrollBy, TspSpan } from "@oh-my-pi/pi-wire";
 import type { Component } from "../tui";
 
 /** A described node: a wire node minus its id, with components allowed as children. */
@@ -115,7 +115,7 @@ export interface NativeScreen extends NativeSurface {
  * component. `key` is the node's key path inside the component (`""` for the
  * component's root node, `"body/3"` for a nested keyed child).
  */
-export type NativeUiEvent =
+export type NativeUiEvent = { readonly viewer?: string } & (
 	| { readonly type: "toggle"; readonly key: string; readonly collapsed: boolean }
 	| { readonly type: "select"; readonly key: string; readonly item: string }
 	| { readonly type: "activate"; readonly key: string; readonly item: string }
@@ -124,7 +124,9 @@ export type NativeUiEvent =
 			readonly key: string;
 			readonly act: string;
 			/** Scope/tab/strip id, sort column, or the prefs row an action control belongs to. */
-			readonly value?: string;
+			readonly value?: string | Readonly<Record<string, TspEventValue>>;
+			readonly item?: string;
+			readonly values?: Readonly<Record<string, TspEventValue>>;
 			readonly mods: readonly string[];
 	  }
 	/** A typed value changed by pointer (prefs rows, picker toggles); `null` resets to the default. */
@@ -132,14 +134,16 @@ export type NativeUiEvent =
 			readonly type: "change";
 			readonly key: string;
 			readonly item: string;
-			readonly value: boolean | number | string | readonly string[] | null;
+			readonly value: TspEventValue;
+			readonly values?: Readonly<Record<string, TspEventValue>>;
 	  }
 	/** An edit over the terminal's own selection in an `editor`/`input` node (see {@link NativeTextEdit}). */
 	| ({ readonly type: "edit"; readonly key: string } & NativeTextEdit)
 	/** Undo the last change to an `editor`/`input` node's text (the terminal's ⌃Z); a no-op with no history. */
 	| { readonly type: "undo"; readonly key: string }
 	/** Submit an explicit prompt through the composer's normal path, preserving the previous draft for recall. */
-	| { readonly type: "send"; readonly key: string; readonly text: string };
+	| { readonly type: "send"; readonly key: string; readonly text: string }
+);
 
 /**
  * A primitive edit the terminal made over its own text selection (cut,

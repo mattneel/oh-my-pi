@@ -812,6 +812,7 @@ export class AdvisorConfigOverlayComponent implements Component {
 		const index = this.#pageIndex();
 		switch (event.type) {
 			case "action": {
+				if (event.value !== undefined && typeof event.value !== "string") return;
 				if (event.act === "page" && event.value) {
 					const match = /^advisor:(\d+)$/.exec(event.value);
 					if (match) this.#showDetail(Number(match[1]));

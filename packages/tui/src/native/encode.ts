@@ -212,14 +212,17 @@ const EVENT_REQUIRED: Readonly<Record<string, Readonly<Record<string, "string" |
 	focus: { id: "string" },
 	error: { msg: "string" },
 	gone: { ids: "array" },
+	key: { sf: "string", viewer: "string", data: "string" },
+	viewer: { viewer: "string", present: "boolean" },
 };
 
 function decodeEvent(value: Record<string, unknown>): TspEvent | null {
 	if (typeof value.ev !== "string") return null;
+	if (value.viewer !== undefined && (typeof value.viewer !== "string" || !value.viewer)) return null;
 	if (value.ev === "send") {
 		const { sf, id, text } = value;
 		if (typeof sf !== "string" || !sf || typeof id !== "string" || !id || typeof text !== "string") return null;
-		return { ev: "send", sf, id, text };
+		return value as TspEvent;
 	}
 	const required = EVENT_REQUIRED[value.ev];
 	if (!required) return null;

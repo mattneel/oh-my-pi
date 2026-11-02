@@ -23,7 +23,8 @@ import type {
 	TspSpan,
 	TspTreeNode,
 } from "@oh-my-pi/pi-wire";
-import { Container, type OverlayHandle, type TUI } from "../tui";
+import { Container, type Component, type OverlayHandle, type OverlayOptions } from "../tui";
+import { ImageBudget } from "../components/image";
 import { matchesKey } from "../keys";
 import { routeSelectListMouse, routeSgrMouseInput, type SelectListMouseTarget } from "../mouse";
 import { padding, visibleWidth, wrapTextWithAnsi } from "../utils";
@@ -81,7 +82,7 @@ import {
 	treeMetadataIndent,
 } from "./agent-hub-renderer";
 import { sanitizeDisplaySingleLine } from "./extensions/display-text";
-import { AgentTranscriptViewer, type AgentTranscriptSource } from "./agent-transcript-viewer";
+import { AgentTranscriptViewer, type AgentTranscriptHost, type AgentTranscriptSource } from "./agent-transcript-viewer";
 import type { AgentRoleDisplay } from "./agent-hub-renderer";
 import { fuzzyMatch } from "../fuzzy";
 import { bottomBorder, divider, dividerSplit, PanelRows, row, topBorder, topBorderSplit } from "../chrome/overlay-box";
@@ -283,6 +284,12 @@ export interface AgentHubRemote {
 	readTranscript(id: string, fromByte: number): Promise<AgentHubRemoteTranscript | null>;
 }
 
+/** A transcript-capable overlay host; no process terminal or global session focus. */
+export type AgentHubHost = AgentTranscriptHost & {
+	showOverlay?(component: Component, options?: OverlayOptions): OverlayHandle;
+	setFocus?(component: Component | null): void;
+};
+
 export interface AgentHubDeps<TRecord extends AgentRecordLike = AgentRecordLike> {
 	/** Progress/status snapshot source (task lifecycle + progress channels). */
 	observers: SessionObserverRegistry;
@@ -302,8 +309,10 @@ export interface AgentHubDeps<TRecord extends AgentRecordLike = AgentRecordLike>
 	lifecycle: () => AgentLifecycleLike<TRecord>;
 	/** Host message bus supplying unread counts. */
 	irc: IrcBusLike;
-	/** TUI handle for transcript components; tests omit it and get a render-only stub. */
-	ui?: TUI;
+	/** Viewer-local overlay and transcript capabilities. */
+	ui?: AgentHubHost;
+	/** Open transcripts without an editor or direct agent prompt channel. */
+	readOnlyTranscripts?: boolean;
 	/** Tool lookup for transcript renderers (labels, custom render functions). */
 	getTool?: (name: string) => AgentTool | undefined;
 	/** Whether the active registry entry came from a built-in factory. */
@@ -460,7 +469,8 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	#detailAgentId: string | undefined;
 
 	// Transcript-viewer launch deps (passed through to AgentTranscriptViewer).
-	#ui: TUI;
+	#ui: AgentHubHost;
+	#readOnlyTranscripts: boolean;
 	#getTool: ((name: string) => AgentTool | undefined) | undefined;
 	#isBuiltInTool: ((name: string) => boolean) | undefined;
 	#getMessageRenderer: ((customType: string) => MessageRenderer | undefined) | undefined;
@@ -501,12 +511,14 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		this.#hubKeys = deps.hubKeys;
 		this.#remote = deps.remote;
 		this.#loadingPersistedSubagents = !this.#remote && Boolean(deps.sessionFile?.endsWith(".jsonl"));
-		this.#ui =
-			deps.ui ??
-			({
-				requestRender: () => deps.requestRender(),
-				requestComponentRender: () => deps.requestRender(),
-			} as unknown as TUI);
+		this.#readOnlyTranscripts = deps.readOnlyTranscripts ?? false;
+		this.#ui = deps.ui ?? {
+			requestRender: deps.requestRender,
+			requestComponentRender: deps.requestRender,
+			resetDisplay: deps.requestRender,
+			imageBudget: new ImageBudget(0, deps.requestRender),
+			lastFrameCostMs: 0,
+		};
 		this.#getTool = deps.getTool;
 		this.#isBuiltInTool = deps.isBuiltInTool;
 		this.#getMessageRenderer = deps.getMessageRenderer;
@@ -644,7 +656,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	 * Open the fullscreen transcript viewer for an agent id (public for table Enter
 	 * and tests). Mounts {@link AgentTranscriptViewer} as a `fullscreen` overlay so it
 	 * owns the alternate screen; the hub table stays mounted underneath and is
-	 * restored when the viewer closes. No-op without a real TUI (render-only test stub).
+	 * restored when the viewer closes. Render-only hosts cannot open overlays.
 	 */
 	openChat(id: string, entryId?: string): void {
 		if (this.#disposed || !this.#registry.get(id)) return;
@@ -660,6 +672,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			observers: this.#observers,
 			lifecycle: this.#remote ? undefined : this.#lifecycle,
 			ui: this.#ui,
+			readOnly: this.#readOnlyTranscripts,
 			getTool: this.#getTool,
 			isBuiltInTool: this.#isBuiltInTool,
 			getMessageRenderer: this.#getMessageRenderer,
@@ -679,7 +692,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		});
 		this.#transcriptViewer = viewer;
 		this.#transcriptOverlay = this.#ui.showOverlay(viewer, { width: "100%", margin: 0, fullscreen: true });
-		this.#ui.setFocus(viewer);
+		this.#ui.setFocus?.(viewer);
 		this.#requestRender();
 	}
 
@@ -820,7 +833,11 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 				if (event.value === "agents" || event.value === "activity") this.#switchSection(event.value);
 				return;
 			case "scope":
-				if (activity && ACTIVITY_FILTERS.includes(event.value as ActivityFilter)) {
+				if (
+					activity &&
+					typeof event.value === "string" &&
+					ACTIVITY_FILTERS.includes(event.value as ActivityFilter)
+				) {
 					this.#setActivityFilter(event.value as ActivityFilter);
 				}
 				return;

@@ -264,6 +264,30 @@ describe.skipIf(process.platform === "win32")("dedicated TSP transport", () => {
 		expect(peer.output).toBe(`${encodeTspHelloQuery()}${queued}${close}`);
 	});
 
+	it("drains acknowledgements in flight after its final frame without resetting the peer", async () => {
+		await using fixture = await SocketFixture.create();
+		const { transport, peer } = await fixture.connect();
+		await peer.write(encodeTspJson("r", HELLO));
+		await transport.hello;
+		const errors: Error[] = [];
+		peer.socket.on("error", error => errors.push(error));
+		const frame = encodeTspJson("f", { sf: "s:1", s: 1, ops: [] });
+		const close = encodeTspJson("x", { id: "s:1", keep: true });
+		let acknowledged = false;
+		peer.socket.on("data", () => {
+			if (acknowledged || !peer.output.includes(frame)) return;
+			acknowledged = true;
+			peer.socket.write(encodeTspJson("e", { ev: "ack", sf: "s:1", s: 1 }));
+		});
+		transport.write(frame);
+		transport.write(close);
+		await transport.close();
+		await peer.closed;
+		expect(peer.output).toBe(`${encodeTspHelloQuery()}${frame}${close}`);
+		expect(acknowledged).toBe(true);
+		expect(errors).toEqual([]);
+	});
+
 	it("delivers a legitimate large blob split into ordinary APC chunks", async () => {
 		await using fixture = await SocketFixture.create();
 		const { transport, peer } = await fixture.connect();

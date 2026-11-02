@@ -7,7 +7,7 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import { addKeyAliases, canonicalKeyId } from "../keybindings";
 import { type KeyId, parseKey } from "../keys";
-import type { Component, TUI } from "../tui";
+import type { Component } from "../tui";
 import { type ThemeColor, theme } from "../theme/theme";
 import {
 	buildSessionModelScope,
@@ -40,6 +40,12 @@ export interface ResolvedRoleModel {
 export interface ModelPickerRegistry extends ModelBrowserRegistry {
 	/** Bring the catalog up to date without rebuilding a current one; `true` when the picker must re-read it. */
 	refreshIfStale(): Promise<boolean>;
+}
+
+/** Painting capability shared by terminal and viewer-local semantic hosts. */
+export interface ModelPickerHost {
+	requestRender(): void;
+	readonly terminal?: { readonly columns: number; readonly rows?: number };
 }
 
 export interface ModelPickerCallbacks {
@@ -116,7 +122,7 @@ function footerHint(mode: "session" | "role" | "task" | "selection"): string {
  * since mouse tracking is reserved for fullscreen overlays.
  */
 export class ModelPickerComponent implements Component {
-	#tui: TUI;
+	#tui: ModelPickerHost;
 	#settings: ModelBrowserSource;
 	#registry: ModelPickerRegistry;
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
@@ -145,7 +151,7 @@ export class ModelPickerComponent implements Component {
 		| undefined;
 
 	constructor(
-		tui: TUI,
+		tui: ModelPickerHost,
 		settings: ModelBrowserSource,
 		registry: ModelPickerRegistry,
 		scopedModels: ReadonlyArray<ScopedModelItem>,

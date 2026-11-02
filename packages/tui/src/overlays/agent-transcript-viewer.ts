@@ -16,7 +16,7 @@
 import type * as fs from "node:fs";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { TspSpan, TspTone } from "@oh-my-pi/pi-wire";
-import type { Component, TUI } from "../tui";
+import type { Component } from "../tui";
 import { Editor } from "../components/editor";
 import { matchesKey } from "../keys";
 import { routeSgrMouseInput } from "../mouse";
@@ -31,7 +31,7 @@ import type { ObservableSession, SessionObserverRegistry } from "./session-obser
 import { getEditorTheme, theme } from "../theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../keybinding-matchers";
 import type { AgentHubRemote } from "./agent-hub";
-import { ChatTranscriptBuilder } from "../chat/chat-transcript-builder";
+import { ChatTranscriptBuilder, type ChatTranscriptBuilderDeps } from "../chat/chat-transcript-builder";
 import {
 	TranscriptBrowser,
 	type TranscriptBrowserFrame,
@@ -60,6 +60,11 @@ export interface AgentTranscriptSource {
 	parseEntries(text: string): AgentTranscriptEntry[];
 }
 
+/** Transcript painting capabilities, without owning a terminal or prompt channel. */
+export type AgentTranscriptHost = ChatTranscriptBuilderDeps["ui"] & {
+	readonly terminal?: { readonly rows?: number; readonly columns?: number };
+};
+
 export interface AgentTranscriptViewerDeps {
 	agentId: string;
 	transcript: AgentTranscriptSource;
@@ -72,7 +77,9 @@ export interface AgentTranscriptViewerDeps {
 	observers?: SessionObserverRegistry;
 	/** Revive+prompt path for messageable local agents. Lazy to avoid touching the global. */
 	lifecycle?: () => AgentLifecycleLike;
-	ui: TUI;
+	ui: AgentTranscriptHost;
+	/** Never create an editor or dispatch prompts, even for a live local agent. */
+	readOnly?: boolean;
 	getTool?: (name: string) => AgentTool | undefined;
 	/** Whether the active registry entry came from a built-in factory. */
 	isBuiltInTool?: (name: string) => boolean;
@@ -207,6 +214,8 @@ export class AgentTranscriptViewer implements Component {
 		this.#initialEntryId = deps.initialEntryId;
 		this.#builder = new ChatTranscriptBuilder({
 			ui: deps.ui,
+			retainFullToolContent: deps.readOnly,
+			nativeIdentity: deps.readOnly,
 			getTool: deps.getTool,
 			isBuiltInTool: deps.isBuiltInTool,
 			getMessageRenderer: deps.getMessageRenderer,
@@ -238,7 +247,7 @@ export class AgentTranscriptViewer implements Component {
 	/** Advisor transcripts are read-only; every other agent revives on send. */
 	get #sendable(): boolean {
 		const ref = this.#deps.registry.get(this.#deps.agentId);
-		if (!ref || ref.kind === "advisor") return false;
+		if (this.#deps.readOnly || !ref || ref.kind === "advisor") return false;
 		return Boolean(this.#deps.remote || this.#deps.lifecycle);
 	}
 
@@ -606,7 +615,7 @@ export class AgentTranscriptViewer implements Component {
 	#submit(text: string): void {
 		const trimmed = text.trim();
 		this.#editor?.setText("");
-		if (!trimmed) return;
+		if (this.#deps.readOnly || !trimmed) return;
 		this.#notice = undefined;
 		const id = this.#deps.agentId;
 		if (this.#deps.remote) {

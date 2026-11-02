@@ -143,7 +143,7 @@ export function pickerEvent(event: NativeUiEvent, key = ""): PickerEvent | undef
 		case "activate":
 			return { kind: event.type, item: event.item };
 		case "action":
-			return { kind: "action", act: event.act, value: event.value };
+			return { kind: "action", act: event.act, value: typeof event.value === "string" ? event.value : undefined };
 		default:
 			return undefined;
 	}

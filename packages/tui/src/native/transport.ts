@@ -43,6 +43,7 @@ function targetError(target: string, detail: string, cause?: unknown): Error {
 
 class DuplexTspTransport implements TspTransport {
 	#socket: Bun.Socket | undefined;
+	#peerEnded = false;
 	#fd: DuplexFd | undefined;
 	#fdWrite: Promise<void> | undefined;
 	#fdClosing: Promise<void> | undefined;
@@ -125,9 +126,11 @@ class DuplexTspTransport implements TspTransport {
 					drain: () => this.#flushOutput(),
 					error: (_socket, error) => this.#fail(targetError(this.#target, error.message, error)),
 					close: () => this.#release(),
-					end: () => {
+					end: socket => {
+						this.#peerEnded = true;
 						this.#rejectHello(targetError(this.#target, "peer disconnected before a valid hello reply"));
-						void this.close();
+						if (this.#closing && this.#output.length === 0) socket.end();
+						else void this.close();
 					},
 				},
 			});
@@ -239,7 +242,12 @@ class DuplexTspTransport implements TspTransport {
 				this.#output.shift();
 				this.#outputOffset = 0;
 			}
-			if (this.#closing) socket.end();
+			if (this.#closing) {
+				// Late ACKs may already be in flight after the final frame. Keep
+				// reading until the peer's FIN so a close never resets its socket.
+				if (this.#peerEnded) socket.end();
+				else socket.shutdown(false); // Bun selects the read side with true; false is SHUT_WR.
+			}
 		} catch (error) {
 			const failure = targetError(this.#target, `write failed: ${String(error)}`, error);
 			if (this.#closing) {
