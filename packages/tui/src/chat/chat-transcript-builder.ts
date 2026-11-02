@@ -67,7 +67,12 @@ import {
 } from "./read-tool-group";
 import { isReplyWrite, ReplyWriteComponent, replyDisplayMessage, toolResultReplies } from "./reply-write";
 import { SkillMessageComponent } from "./skill-message";
-import { ToolExecutionComponent, type ToolExecutionHandle, toolRenderName } from "./tool-execution";
+import {
+	ToolExecutionComponent,
+	type ToolExecutionHandle,
+	type ToolPermissionState,
+	toolRenderName,
+} from "./tool-execution";
 import { reconcileStreamedToolCallIds } from "./streamed-tool-call-ids";
 import { TranscriptContainer } from "../chrome/transcript-container";
 import { createUsageRowBlock, TurnUsageTally, turnElapsedMs } from "../overlays/usage-row";
@@ -91,6 +96,10 @@ export interface ChatTranscriptBuilderDeps {
 	linkTargets?: ReadonlyMap<string, string>;
 	/** Draw charts under numeric tables; false for transcripts that are not the main session's. Default: true. */
 	tableCharts?: boolean;
+	/** Use durable session/host wire keys and explicit Yard context (ACP viewers feature only). */
+	nativeIdentity?: boolean;
+	/** Keep native tool bodies complete independently of viewer-local folds (ACP viewers only). */
+	retainFullToolContent?: boolean;
 	requestRender: () => void;
 }
 
@@ -106,6 +115,8 @@ interface StreamingAssistant {
 export class ChatTranscriptBuilder {
 	readonly container = new TranscriptContainer();
 	#pendingTools = new Map<string, ToolExecutionHandle>();
+	#toolCards = new Map<string, ToolExecutionComponent>();
+	#toolPermissions = new Map<string, ToolPermissionState>();
 	#readArgs = new Map<string, Record<string, unknown>>();
 	#readGroup: ReadToolGroupComponent | null = null;
 	#pendingUsage: Usage | undefined;
@@ -205,11 +216,22 @@ export class ChatTranscriptBuilder {
 		this.#readGroup = null;
 	}
 
+	/** Project ACP authority, retaining requests that arrive before their tool card. */
+	setToolPermission(id: string, permission: ToolPermissionState | undefined): void {
+		if (permission) this.#toolPermissions.set(id, permission);
+		else this.#toolPermissions.delete(id);
+		this.#toolCards.get(id)?.setToolPermission(permission);
+		this.#deps.requestRender();
+	}
+
 	startToolExecution(id: string, name: string, args: Record<string, unknown>): void {
 		if (this.#completedTools.has(id)) return;
 		let component = this.#pendingTools.get(id);
 		if (!component) {
-			const groupedRead = name === "read" && (this.#readArgs.has(id) || readArgsCollapseIntoGroup(args));
+			const groupedRead =
+				!this.#deps.retainFullToolContent &&
+				name === "read" &&
+				(this.#readArgs.has(id) || readArgsCollapseIntoGroup(args));
 			if (groupedRead) {
 				component = this.#ensureReadGroup();
 			} else {
@@ -293,6 +315,7 @@ export class ChatTranscriptBuilder {
 	reset(): void {
 		for (const pending of this.#pendingTools.values()) pending.seal();
 		this.#pendingTools.clear();
+		this.#toolCards.clear();
 		this.#readArgs.clear();
 		this.#readGroup = null;
 		this.#pendingUsage = undefined;
@@ -321,13 +344,14 @@ export class ChatTranscriptBuilder {
 
 	dispose(): void {
 		this.reset();
+		this.#toolPermissions.clear();
 	}
 
 	#appendEntry(entry: TranscriptEntry): void {
 		const message = transcriptEntryMessage(entry);
 		if (!message) return;
 		const before = this.container.children.length;
-		this.#appendChatMessage(message);
+		this.#appendChatMessage(message.role === "assistant" ? { ...message, sessionEntryId: entry.id } : message);
 		const components = this.container.children.slice(before);
 		if (components.length > 0) this.#entryComponents.set(entry.id, components);
 	}
@@ -460,7 +484,8 @@ export class ChatTranscriptBuilder {
 				if (message.role === "user") this.#resolveWaitingPoll();
 				if (message.role === "user") this.#resolveTodoSnapshot();
 				const userText = message.role === "user" ? textContent(message.content) : "";
-				if (userText) {
+				const yard = this.#deps.nativeIdentity && message.role === "user" ? message.clankyard : undefined;
+				if (userText || yard) {
 					const isSynthetic = message.role === "developer" ? true : (message.synthetic ?? false);
 					// Synthetic (agent-attributed) inputs — chiefly the advisor's `Session
 					// update` replay dumps — can be hundreds of KiB of Markdown each.
@@ -473,7 +498,9 @@ export class ChatTranscriptBuilder {
 						this.container.addChild(collapsed);
 					} else {
 						this.container.addChild(
-							new UserMessageComponent(userText, {
+							new UserMessageComponent(yard?.displayText ?? userText, {
+								key: yard?.turnId,
+								context: yard?.context,
 								liveSteered: message.role === "user" && message.liveSteered === true,
 								timestamp: message.timestamp,
 								images: imageContent(message.content),
@@ -567,7 +594,7 @@ export class ChatTranscriptBuilder {
 		const tool = this.#deps.getTool?.(name);
 		const renderName = toolRenderName(name, tool);
 		const builtIn = this.#deps.isBuiltInTool?.(renderName) ?? true;
-		if (builtIn && isReplyWrite(renderName, args) === true) {
+		if (!this.#deps.retainFullToolContent && builtIn && isReplyWrite(renderName, args) === true) {
 			const reply = new ReplyWriteComponent({
 				requestRender: () => this.#deps.requestRender(),
 				imageBudget: this.#deps.ui.imageBudget,
@@ -582,12 +609,15 @@ export class ChatTranscriptBuilder {
 			{
 				useBuiltInRenderer: builtIn,
 				showImages: this.#preferences.showImages,
+				retainFullContent: this.#deps.retainFullToolContent,
 			},
 			tool,
 			this.#deps.ui,
 			this.#deps.cwd,
 			id,
 		);
+		this.#toolCards.set(id, component);
+		component.setToolPermission(this.#toolPermissions.get(id));
 		this.#trackExpandable(component);
 		this.container.addChild(component);
 		return component;
@@ -641,6 +671,9 @@ export class ChatTranscriptBuilder {
 			idsByIndex: new Map<number, string>(),
 			hasVisibleContent: false,
 		};
+		if (this.#deps.nativeIdentity && message.sessionEntryId) {
+			state.before.setNativeKey(`${message.sessionEntryId}:before`);
+		}
 		const finalCallIds = transient ? undefined : new Set<string>();
 		if (finalCallIds) {
 			for (const call of message.content) {
@@ -663,6 +696,11 @@ export class ChatTranscriptBuilder {
 				state.tools.delete(oldId);
 				state.tools.set(newId, component);
 				if (component instanceof ReadToolGroupComponent) component.renameEntry(oldId, newId);
+				if (component instanceof ToolExecutionComponent) {
+					this.#toolCards.delete(oldId);
+					this.#toolCards.set(newId, component);
+					component.setToolPermission(this.#toolPermissions.get(newId) ?? this.#toolPermissions.get(oldId));
+				}
 			}
 			const pending = this.#pendingTools.get(oldId);
 			if (pending && !this.#pendingTools.has(newId)) {
@@ -756,7 +794,12 @@ export class ChatTranscriptBuilder {
 			) {
 				continue;
 			}
-			if (!component && renderName === "read" && readArgsCollapseIntoGroup(args)) {
+			if (
+				!component &&
+				!this.#deps.retainFullToolContent &&
+				renderName === "read" &&
+				readArgsCollapseIntoGroup(args)
+			) {
 				if (errorMessage || afterToolSegment || transient) {
 					component = this.#ensureReadGroup();
 					state.tools.set(call.id, component);
@@ -810,6 +853,9 @@ export class ChatTranscriptBuilder {
 							children.splice(anchorIndex + 1, 0, segment);
 						}
 					}
+				}
+				if (this.#deps.nativeIdentity && message.sessionEntryId) {
+					segment.setNativeKey(`${message.sessionEntryId}:after:${call.id}`);
 				}
 				segment.updateContent(afterToolSegment, { transient });
 				lastAssistantComponent = segment;

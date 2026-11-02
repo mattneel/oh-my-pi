@@ -2096,15 +2096,30 @@ export class SessionManager {
 		const repairedUsage = normalizeLoadedUsage(entries);
 		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
 		this.#index.rebuild(entries);
+		for (const entry of entries) {
+			if (entry.type === "message" && entry.message.role === "assistant") entry.message.sessionEntryId = entry.id;
+		}
 	}
 
-	#freshEntryFields(): { id: string; parentId: string | null; timestamp: string; runtime: RuntimeIdentity } {
+	#freshEntryFields(reservedId?: string): {
+		id: string;
+		parentId: string | null;
+		timestamp: string;
+		runtime: RuntimeIdentity;
+	} {
 		return {
-			id: generateId(this.#index),
+			id: reservedId ?? generateId(this.#index),
 			parentId: this.#index.leafId(),
 			timestamp: nowIso(),
 			runtime: currentRuntimeIdentity(),
 		};
+	}
+	/** Reserve an assistant identity before streaming, without advancing the branch. */
+	reserveMessageEntryId(): string {
+		// Full UUIDs cannot collide with the ordinary eight-hex entry allocator.
+		let id = crypto.randomUUID();
+		while (this.#index.has(id)) id = crypto.randomUUID();
+		return id;
 	}
 
 	#setLeaf(id: string | null): void {
@@ -3539,7 +3554,10 @@ export class SessionManager {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): string {
-		const entry: SessionMessageEntry = { type: "message", ...this.#freshEntryFields(), message };
+		const reservedId = message.role === "assistant" ? message.sessionEntryId : undefined;
+		const fields = this.#freshEntryFields(reservedId && !this.#index.has(reservedId) ? reservedId : undefined);
+		if (message.role === "assistant") message.sessionEntryId = fields.id;
+		const entry: SessionMessageEntry = { type: "message", ...fields, message };
 		this.#recordEntry(entry);
 		return entry.id;
 	}
