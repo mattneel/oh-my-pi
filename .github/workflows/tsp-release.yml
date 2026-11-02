@@ -74,6 +74,14 @@ jobs:
               packages/coding-agent/test/acp-agent.test.ts
               packages/coding-agent/test/acp-cockpit.test.ts
               packages/coding-agent/test/acp-status-overlays.test.ts
+              packages/coding-agent/test/acp-model-screen.test.ts
+              packages/coding-agent/test/acp-config-screens.test.ts
+              packages/coding-agent/test/acp-auth-screen.test.ts
+              packages/coding-agent/test/acp-report-screens.test.ts
+              packages/coding-agent/test/available-commands.test.ts
+              packages/coding-agent/test/model-hub.test.ts
+              packages/coding-agent/test/model-presets.test.ts
+              packages/coding-agent/test/selector-controller-settings-single.test.ts
               packages/utils/test/acp.test.ts
               packages/coding-agent/test/cli-tsp-flag.test.ts
               packages/coding-agent/test/cli-non-tty-launch.test.ts
@@ -81,6 +89,11 @@ jobs:
               packages/tui/test/native/transcript-native.test.ts
               packages/tui/test/native/transport.test.ts
               packages/tui/test/git-commit-view-hints.test.ts
+              packages/tui/test/native/viewers.test.ts
+              packages/tui/test/agents-hub.test.ts
+              packages/tui/test/settings-prefs-native.test.ts
+              packages/tui/test/model-hub-assign-scope.test.ts
+              packages/tui/test/model-hub-roles-search.test.ts
          - name: Build the release binary
            env:
               RELEASE_TARGETS: linux-x64

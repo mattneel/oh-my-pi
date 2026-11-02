@@ -59,7 +59,8 @@ import { buildSessionContextView } from "../../session/context-view";
 import { buildHotkeysMarkdown, HotkeysSheetComponent } from "@oh-my-pi/pi-tui/hotkeys-markdown";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { buildToolsMarkdown } from "@oh-my-pi/pi-tui/prompt/tools-markdown";
-import type { AsyncJobSnapshotItem } from "../../session/agent-session";
+import type { AgentSession, AsyncJobSnapshotItem } from "../../session/agent-session";
+import type { AsyncJobTree } from "../../session/agent-session-types";
 import { buildJobTree, jobTreeGuide, jobTreeIndent } from "@oh-my-pi/pi-tui/overlays/job-tree";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
@@ -92,6 +93,7 @@ import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs, shortenEmbeddedPaths, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import {
+	type ChangelogView,
 	getChangelogPath,
 	parseChangelog,
 	parseChangelogView,
@@ -570,280 +572,12 @@ export class CommandController {
 	}
 
 	async handleSessionCommand(): Promise<void> {
-		const stats = this.ctx.session.getSessionStats();
-		const premiumRequests =
-			"premiumRequests" in stats && typeof stats.premiumRequests === "number"
-				? stats.premiumRequests
-				: this.ctx.session.sessionManager.getUsageStatistics().premiumRequests;
-		const normalizedPremiumRequests = Math.round((premiumRequests + Number.EPSILON) * 100) / 100;
-
-		let info = "";
-		info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
-		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n`;
-		const builds = runtimeIdentityHistory(this.ctx.session.sessionManager.getEntries());
-		const running = currentRuntimeIdentity();
-		// A source checkout's diff hash changes with each edit, so a long-lived session can collect
-		// many builds: keep the first and the latest few. Every row is keyed so the overlay never
-		// mistakes a colourless continuation row for a section heading.
-		const hidden = builds.length > MAX_LISTED_BUILDS ? builds.length - MAX_LISTED_BUILDS + 1 : 0;
-		for (const [index, build] of builds.entries()) {
-			if (hidden > 0 && index > 0 && index <= hidden) {
-				if (index === 1) info += `${theme.fg("dim", `Builds 2–${hidden + 1}:`)} ${hidden} more\n`;
-				continue;
-			}
-			const key = builds.length === 1 ? "Build:" : `Build ${index + 1}:`;
-			info += `${theme.fg("dim", key)} ${replaceTabs(sanitizeText(formatRuntimeIdentity(build)))}\n`;
-		}
-		if (!sameRuntimeIdentity(builds[builds.length - 1], running)) {
-			info += `${theme.fg("dim", "Running:")} ${replaceTabs(sanitizeText(formatRuntimeIdentity(running)))}\n`;
-		}
-		info += `\n${theme.bold("Provider")}\n`;
-		const model = this.ctx.session.model;
-		if (!model) {
-			info += `${theme.fg("dim", "No model selected")}\n`;
-		} else {
-			const authMode = resolveProviderAuthMode(this.ctx.session.modelRegistry.authStorage, model.provider);
-			const credentialSource = this.ctx.session.modelRegistry.authStorage.keys.describe(
-				model.provider,
-				stats.sessionId,
-			);
-			const providerDetails = getProviderDetails({
-				model,
-				sessionId: stats.sessionId,
-				authMode,
-				credentialSource,
-				preferWebsockets: this.ctx.session.preferWebsockets,
-				providerSessionState: this.ctx.session.providerSessionState,
-			});
-			info += renderProviderSection(providerDetails, theme);
-			if (stats.routedModels !== undefined) {
-				const routed = Object.entries(stats.routedModels)
-					.sort(([aId, aCount], [bId, bCount]) => bCount - aCount || aId.localeCompare(bId))
-					.map(
-						([id, count]) => `${replaceTabs(sanitizeText(id))}${count > 1 ? theme.fg("dim", ` ×${count}`) : ""}`,
-					);
-				info += `${theme.fg("dim", "Served:")} ${routed.join(", ")}\n`;
-			}
-		}
-		info += `\n`;
-		info += `${theme.bold("Messages")}\n`;
-		info += `${theme.fg("dim", "User:")} ${stats.userMessages}\n`;
-		info += `${theme.fg("dim", "Assistant:")} ${stats.assistantMessages}\n`;
-		info += `${theme.fg("dim", "Tool Calls:")} ${stats.toolCalls}\n`;
-		info += `${theme.fg("dim", "Tool Results:")} ${stats.toolResults}\n`;
-		if (stats.editRejections !== undefined) {
-			const kinds = Object.entries(stats.editRejections).sort(
-				([aKind, aCount], [bKind, bCount]) => bCount - aCount || aKind.localeCompare(bKind),
-			);
-			const total = kinds.reduce((sum, [, count]) => sum + count, 0);
-			const breakdown = kinds
-				.map(([kind, count]) => `${replaceTabs(sanitizeText(kind.replaceAll("_", " ")))} ${count}`)
-				.join(", ");
-			info += `${theme.fg("dim", "Edit Rejections:")} ${total} ${theme.fg("dim", `(${breakdown})`)}\n`;
-		}
-		info += `${theme.fg("dim", "Total:")} ${stats.totalMessages}\n\n`;
-		// Append-only context
-		{
-			const setting = cfgProviderAppendOnlyContext.get(this.ctx.settings);
-			const model = this.ctx.session.model;
-			const mode = shouldEnableAppendOnlyContext(setting, model);
-			const activeLabel = mode ? theme.fg("success", "active") : theme.fg("dim", "inactive");
-			const settingLabel = setting === "auto" ? `${setting} (${model?.provider ?? "?"})` : setting;
-			info += `${theme.fg("dim", "Append-Only:")} ${activeLabel} (setting: ${settingLabel})\n`;
-		}
-		info += `${theme.bold("Tokens")}\n`;
-		info += `${theme.fg("dim", "Input:")} ${stats.tokens.input.toLocaleString()}\n`;
-		info += `${theme.fg("dim", "Output:")} ${stats.tokens.output.toLocaleString()}\n`;
-		if (stats.tokens.cacheRead > 0) {
-			info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
-		}
-		if (stats.tokens.cacheWrite > 0) {
-			info += `${theme.fg("dim", "Cache Write:")} ${stats.tokens.cacheWrite.toLocaleString()}\n`;
-		}
-		info += `${theme.fg("dim", "Total:")} ${stats.tokens.total.toLocaleString()}\n`;
-
-		if (stats.cost > 0 || normalizedPremiumRequests > 0 || stats.credits !== undefined) {
-			info += `\n${theme.bold("Cost")}\n`;
-			if (stats.cost > 0) {
-				info += `${theme.fg("dim", "Total:")} ${stats.cost.toFixed(4)}\n`;
-			}
-			if (normalizedPremiumRequests > 0) {
-				info += `${theme.fg("dim", "Premium Requests:")} ${normalizedPremiumRequests.toLocaleString()}\n`;
-			}
-			if (stats.credits !== undefined) {
-				info += `${theme.fg("dim", "Credits:")} ${formatCreditValue(stats.credits.cost)}\n`;
-				info += `${theme.fg("dim", "Committed Credits:")} ${formatCreditValue(stats.credits.committedCost)}\n`;
-				info += `${theme.fg("dim", "Committed ACU:")} ${formatCreditValue(stats.credits.acuCost)}\n`;
-			}
-		}
-
-		if (this.ctx.lspServers && this.ctx.lspServers.length > 0) {
-			info += `\n${theme.bold("LSP Servers")}\n`;
-			for (const server of this.ctx.lspServers) {
-				const statusColor =
-					server.status === "ready"
-						? "success"
-						: server.status === "available"
-							? "dim"
-							: server.status === "connecting"
-								? "warning"
-								: "error";
-				const statusText =
-					server.status === "error" && server.error ? `${server.status}: ${server.error}` : server.status;
-				info += `${theme.fg("dim", `${server.name}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${server.fileTypes.join(", ")})`)}\n`;
-			}
-		}
-
-		if (this.ctx.mcpManager) {
-			const mcpServers = this.ctx.mcpManager.getConnectedServers();
-			info += `\n${theme.bold("MCP Servers")}\n`;
-			if (mcpServers.length === 0) {
-				info += `${theme.fg("dim", "None connected")}\n`;
-			} else {
-				for (const name of mcpServers) {
-					const conn = this.ctx.mcpManager.getConnection(name);
-					const toolCount = conn?.tools?.length ?? 0;
-					info += `${theme.fg("dim", `${name}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
-				}
-			}
-		}
-
-		this.ctx.showSessionInfo(info, this.ctx.session.getContextUsage());
+		this.ctx.showSessionInfo(buildSessionInfo(this.ctx.session, this.ctx), this.ctx.session.getContextUsage());
 	}
 
-	static readonly #advisorStatusGlyph: Record<string, string> = {
-		running: "●",
-		paused: "○",
-		no_model: "○",
-		quota_exhausted: "✕",
-		error: "✕",
-	};
-
-	static readonly #advisorStatusLabel: Record<string, string> = {
-		running: "running",
-		paused: "off",
-		no_model: "no model",
-		quota_exhausted: "quota exhausted",
-		error: "error",
-	};
-
 	async handleAdvisorStatusCommand(): Promise<void> {
-		const stats = this.ctx.session.getAdvisorStats();
-		if (!stats.configured) {
-			this.showCommandReport({ title: "Advisor Status", body: new Text("Advisor is disabled.", 0, 0) });
-			return;
-		}
-		// Render cached quota data without waiting for the network. Quota lines
-		// are optional, and the refresh below serves the next invocation.
-		const usageProvider = this.ctx.session as {
-			cachedUsageReports?: UsageReport[];
-			fetchUsageReports?: () => Promise<UsageReport[] | null>;
-		};
-		const usageReports: UsageReport[] | null = usageProvider.cachedUsageReports ?? null;
-		// Warm the snapshot for the next invocation. The fetch logs its own
-		// failures, and a missing quota line is non-fatal by design.
-		void usageProvider.fetchUsageReports?.().catch(() => {});
-		// Resolve the active OAuth identity for each advisor's provider so quota
-		// filtering matches the credential actually in use (not sibling accounts).
-		const resolveActiveAdvisorAccount = (provider: string, sessionId?: string): OAuthAccountIdentity | undefined =>
-			this.ctx.session.modelRegistry.authStorage.oauth.identity(provider, sessionId ?? this.ctx.session.sessionId);
-		const nowMs = Date.now();
-		// Roster view: show every configured advisor with its status, even when
-		// none are live (all paused/no-model). The old code returned a generic
-		// message that hid the per-advisor state the user needs to act on.
-		if (stats.advisors.length > 1 || (stats.configured && !stats.active)) {
-			let info = "";
-			for (const a of stats.advisors) {
-				const glyph = CommandController.#advisorStatusGlyph[a.status] ?? "?";
-				const label = CommandController.#advisorStatusLabel[a.status] ?? a.status;
-				const color =
-					a.status === "running"
-						? "success"
-						: a.status === "quota_exhausted" || a.status === "error"
-							? "error"
-							: "dim";
-				info += `\n${theme.fg(color, glyph)} ${theme.bold(a.name)} ${theme.fg("dim", `[${label}]`)}\n`;
-				if (a.model) {
-					info += `${theme.fg("dim", "Model:")} ${a.model.provider}/${a.model.id}\n`;
-				}
-				if (a.model && usageReports) {
-					const identity = resolveActiveAdvisorAccount(a.model.provider, a.sessionId);
-					const quota = formatCompactQuota(
-						a.model.provider,
-						collapseSharedUsageReports(usageReports),
-						nowMs,
-						(report, limit) => !identity || limitMatchesActiveAccount(report, limit, identity),
-					);
-					if (quota) info += `${theme.fg("dim", quota)}\n`;
-				}
-				if (a.status === "running" || a.status === "quota_exhausted") {
-					const ctx =
-						a.contextWindow > 0
-							? `${a.contextTokens.toLocaleString()} / ${a.contextWindow.toLocaleString()} (${Math.round((a.contextTokens / a.contextWindow) * 100)}%)`
-							: `${a.contextTokens.toLocaleString()}`;
-					info += `${theme.fg("dim", "Context:")} ${ctx}\n`;
-					info += `${theme.fg("dim", "Messages:")} ${a.messages.total.toLocaleString()}\n`;
-					info += `${theme.fg("dim", "Spend:")} ${a.tokens.input.toLocaleString()} in / ${a.tokens.output.toLocaleString()} out`;
-					if (a.cost > 0) info += `, $${a.cost.toFixed(4)}`;
-					info += "\n";
-				}
-			}
-			if (stats.active) {
-				info += `\n${theme.bold("Totals")}\n`;
-				info += `${theme.fg("dim", "Tokens:")} ${stats.tokens.total.toLocaleString()}\n`;
-				if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
-			}
-			this.showCommandReport({
-				title: `Advisor Status (${stats.advisors.length} advisors)`,
-				body: new Text(info.trim(), 0, 0),
-			});
-			return;
-		}
-		// Single active advisor — detailed view.
-		const model = stats.model;
-		let info = "";
-		if (stats.advisors.length === 1) {
-			const a = stats.advisors[0];
-			const glyph = CommandController.#advisorStatusGlyph[a.status] ?? "?";
-			const label = CommandController.#advisorStatusLabel[a.status] ?? a.status;
-			info += `${theme.fg(a.status === "running" ? "success" : "error", glyph)} ${a.name} ${theme.fg("dim", `[${label}]`)}\n\n`;
-		}
-		if (model) {
-			info += `${theme.bold("Provider")}\n`;
-			info += `${theme.fg("dim", "Model:")} ${model.provider}/${model.id}\n`;
-		}
-		if (model && usageReports) {
-			const identity = resolveActiveAdvisorAccount(model.provider, stats.advisors[0]?.sessionId);
-			const quota = formatCompactQuota(
-				model.provider,
-				collapseSharedUsageReports(usageReports),
-				nowMs,
-				(report, limit) => !identity || limitMatchesActiveAccount(report, limit, identity),
-			);
-			if (quota) {
-				info += `\n${theme.bold("Quota")}\n`;
-				info += `${theme.fg("dim", quota)}\n`;
-			}
-		}
-		info += `\n${theme.bold("Messages")}\n`;
-		info += `${theme.fg("dim", "User:")} ${stats.messages.user.toLocaleString()}\n`;
-		info += `${theme.fg("dim", "Assistant:")} ${stats.messages.assistant.toLocaleString()}\n`;
-		info += `${theme.fg("dim", "Total:")} ${stats.messages.total.toLocaleString()}\n`;
-		info += `\n${theme.bold("Context")}\n`;
-		if (stats.contextWindow > 0) {
-			const percent = Math.round((stats.contextTokens / stats.contextWindow) * 100);
-			info += `${theme.fg("dim", "Tokens:")} ${stats.contextTokens.toLocaleString()} / ${stats.contextWindow.toLocaleString()} (${percent}%)\n`;
-		} else {
-			info += `${theme.fg("dim", "Tokens:")} ${stats.contextTokens.toLocaleString()}\n`;
-		}
-		info += `\n${theme.bold("Spend")}\n`;
-		info += `${theme.fg("dim", "Input:")} ${stats.tokens.input.toLocaleString()}\n`;
-		info += `${theme.fg("dim", "Output:")} ${stats.tokens.output.toLocaleString()}\n`;
-		if (stats.tokens.cacheRead > 0) {
-			info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
-		}
-		if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
-		this.showCommandReport({ title: "Advisor Status", body: new Text(info.trim(), 0, 0) });
+		const report = buildAdvisorStatusReport(this.ctx.session);
+		this.showCommandReport({ title: report.title, body: new Text(report.text, 0, 0) });
 	}
 
 	/**
@@ -865,48 +599,10 @@ export class CommandController {
 			return;
 		}
 
-		const now = Date.now();
-		const columns = this.ctx.ui.terminal.columns ?? 100;
-		let info = `${theme.fg("dim", "Running:")} ${tree.running.length}\n`;
-		if (tree.running.length === 0 && tree.recent.length === 0) {
-			info += `\n${theme.fg("dim", "No async jobs yet.")}`;
-			this.showCommandReport({ title: "Background Jobs", body: new Text(info, 0, 0) });
-			return;
-		}
-
-		// Lines under a row hang off its tree rails. Full mode wraps here so
-		// every line, including heredoc lines and wrap continuations, keeps that
-		// indent inside the report box.
-		info += "\n";
-		for (const row of buildJobTree([...tree.running, ...tree.recent], tree.agents, tree.rootId)) {
-			const guide = theme.fg("dim", jobTreeGuide(row, theme));
-			if (row.kind === "agent") {
-				info += `${guide}${theme.bold(row.agent.id)}\n`;
-				continue;
-			}
-			const { job } = row;
-			// A spawned subagent's task job takes the agent's id as its id and label: name it once.
-			const agent = row.agent && row.agent.id !== job.id ? ` ${theme.bold(row.agent.id)}` : "";
-			info += `${guide}${renderJobLine(job, now)}${agent}\n`;
-			// What the job is for leads; full mode follows it with what the command does and the whole command.
-			const text = full ? (job.command ?? job.label) : (job.intent ?? job.label);
-			if (text === job.id) continue;
-			const indent = jobTreeIndent(row, theme);
-			const prefix = theme.fg("dim", indent);
-			if (!full) {
-				const label = truncateJobLabel(text, Math.max(24, columns - 22 - visibleWidth(indent)));
-				info += `${prefix}${theme.fg("dim", label)}\n`;
-				continue;
-			}
-			for (const line of wrapTextWithAnsi(
-				shortenEmbeddedPaths(replaceTabs(sanitizeText([job.intent, job.caption, text].filter(Boolean).join("\n")))),
-				Math.max(1, columns - 4 - visibleWidth(indent)),
-			)) {
-				info += `${prefix}${theme.fg("dim", line)}\n`;
-			}
-		}
-
-		this.showCommandReport({ title: "Background Jobs", body: new Text(info.trimEnd(), 0, 0) });
+		this.showCommandReport({
+			title: "Background Jobs",
+			body: new Text(buildJobsReport(tree, this.ctx.ui.terminal.columns ?? 100, full), 0, 0),
+		});
 	}
 
 	async handleUsageCommand(reports?: UsageReport[] | null): Promise<void> {
@@ -933,27 +629,8 @@ export class CommandController {
 			this.ctx.showWarning(view.error);
 			return;
 		}
-		const changelogPath = getChangelogPath();
-		const allEntries = await parseChangelog(changelogPath);
-		const entriesToShow = selectChangelogEntries(allEntries, view);
-		const changelogMarkdown =
-			entriesToShow.length > 0 ? renderChangelogEntries(entriesToShow).markdown : "No changelog entries found.";
-		const shown = entriesToShow.length;
-		const titleCount = shown > 0 ? shown : view.kind === "last" ? view.count : shown;
-		const title =
-			view.kind === "full"
-				? "Full Changelog"
-				: view.kind === "last"
-					? titleCount === 1
-						? "Last Release"
-						: `Last ${titleCount} Releases`
-					: "Recent Changes";
-		const hint =
-			view.kind === "full"
-				? ""
-				: `\n\n${theme.fg("dim", "Use")} ${theme.bold("/changelog full")} ${theme.fg("dim", "to view the complete changelog.")}`;
-
-		this.#showMarkdownPanel(title, changelogMarkdown + hint);
+		const report = await buildChangelogReport(view);
+		this.#showMarkdownPanel(report.title, report.markdown);
 	}
 
 	handleHotkeysCommand(): void {
@@ -2956,4 +2633,342 @@ export function renderUsageReports(
 	}
 
 	return lines.join("\n");
+}
+
+/** Runtime-only details supplied by the interactive shell when available. */
+export type SessionReportServices = Partial<Pick<InteractiveModeContext, "settings" | "lspServers" | "mcpManager">>;
+
+/** Shared /session body for the native overlay and ordinary interactive command. */
+export function buildSessionInfo(session: AgentSession, services: SessionReportServices = {}): string {
+	const stats = session.getSessionStats();
+	const premiumRequests =
+		"premiumRequests" in stats && typeof stats.premiumRequests === "number"
+			? stats.premiumRequests
+			: session.sessionManager.getUsageStatistics().premiumRequests;
+	const normalizedPremiumRequests = Math.round((premiumRequests + Number.EPSILON) * 100) / 100;
+
+	let info = "";
+	info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
+	info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n`;
+	const builds = runtimeIdentityHistory(session.sessionManager.getEntries());
+	const running = currentRuntimeIdentity();
+	// A source checkout's diff hash changes with each edit, so a long-lived session can collect
+	// many builds: keep the first and the latest few. Every row is keyed so the overlay never
+	// mistakes a colourless continuation row for a section heading.
+	const hidden = builds.length > MAX_LISTED_BUILDS ? builds.length - MAX_LISTED_BUILDS + 1 : 0;
+	for (const [index, build] of builds.entries()) {
+		if (hidden > 0 && index > 0 && index <= hidden) {
+			if (index === 1) info += `${theme.fg("dim", `Builds 2–${hidden + 1}:`)} ${hidden} more\n`;
+			continue;
+		}
+		const key = builds.length === 1 ? "Build:" : `Build ${index + 1}:`;
+		info += `${theme.fg("dim", key)} ${replaceTabs(sanitizeText(formatRuntimeIdentity(build)))}\n`;
+	}
+	if (!sameRuntimeIdentity(builds[builds.length - 1], running)) {
+		info += `${theme.fg("dim", "Running:")} ${replaceTabs(sanitizeText(formatRuntimeIdentity(running)))}\n`;
+	}
+	info += `\n${theme.bold("Provider")}\n`;
+	const model = session.model;
+	if (!model) {
+		info += `${theme.fg("dim", "No model selected")}\n`;
+	} else {
+		const authMode = resolveProviderAuthMode(session.modelRegistry.authStorage, model.provider);
+		const credentialSource = session.modelRegistry.authStorage.keys.describe(model.provider, stats.sessionId);
+		const providerDetails = getProviderDetails({
+			model,
+			sessionId: stats.sessionId,
+			authMode,
+			credentialSource,
+			preferWebsockets: session.preferWebsockets,
+			providerSessionState: session.providerSessionState,
+		});
+		info += renderProviderSection(providerDetails, theme);
+		if (stats.routedModels !== undefined) {
+			const routed = Object.entries(stats.routedModels)
+				.sort(([aId, aCount], [bId, bCount]) => bCount - aCount || aId.localeCompare(bId))
+				.map(([id, count]) => `${replaceTabs(sanitizeText(id))}${count > 1 ? theme.fg("dim", ` ×${count}`) : ""}`);
+			info += `${theme.fg("dim", "Served:")} ${routed.join(", ")}\n`;
+		}
+	}
+	info += `\n`;
+	info += `${theme.bold("Messages")}\n`;
+	info += `${theme.fg("dim", "User:")} ${stats.userMessages}\n`;
+	info += `${theme.fg("dim", "Assistant:")} ${stats.assistantMessages}\n`;
+	info += `${theme.fg("dim", "Tool Calls:")} ${stats.toolCalls}\n`;
+	info += `${theme.fg("dim", "Tool Results:")} ${stats.toolResults}\n`;
+	if (stats.editRejections !== undefined) {
+		const kinds = Object.entries(stats.editRejections).sort(
+			([aKind, aCount], [bKind, bCount]) => bCount - aCount || aKind.localeCompare(bKind),
+		);
+		const total = kinds.reduce((sum, [, count]) => sum + count, 0);
+		const breakdown = kinds
+			.map(([kind, count]) => `${replaceTabs(sanitizeText(kind.replaceAll("_", " ")))} ${count}`)
+			.join(", ");
+		info += `${theme.fg("dim", "Edit Rejections:")} ${total} ${theme.fg("dim", `(${breakdown})`)}\n`;
+	}
+	info += `${theme.fg("dim", "Total:")} ${stats.totalMessages}\n\n`;
+	// Append-only context
+	{
+		const setting = cfgProviderAppendOnlyContext.get(services.settings ?? session.settings);
+		const model = session.model;
+		const mode = shouldEnableAppendOnlyContext(setting, model);
+		const activeLabel = mode ? theme.fg("success", "active") : theme.fg("dim", "inactive");
+		const settingLabel = setting === "auto" ? `${setting} (${model?.provider ?? "?"})` : setting;
+		info += `${theme.fg("dim", "Append-Only:")} ${activeLabel} (setting: ${settingLabel})\n`;
+	}
+	info += `${theme.bold("Tokens")}\n`;
+	info += `${theme.fg("dim", "Input:")} ${stats.tokens.input.toLocaleString()}\n`;
+	info += `${theme.fg("dim", "Output:")} ${stats.tokens.output.toLocaleString()}\n`;
+	if (stats.tokens.cacheRead > 0) {
+		info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
+	}
+	if (stats.tokens.cacheWrite > 0) {
+		info += `${theme.fg("dim", "Cache Write:")} ${stats.tokens.cacheWrite.toLocaleString()}\n`;
+	}
+	info += `${theme.fg("dim", "Total:")} ${stats.tokens.total.toLocaleString()}\n`;
+
+	if (stats.cost > 0 || normalizedPremiumRequests > 0 || stats.credits !== undefined) {
+		info += `\n${theme.bold("Cost")}\n`;
+		if (stats.cost > 0) {
+			info += `${theme.fg("dim", "Total:")} ${stats.cost.toFixed(4)}\n`;
+		}
+		if (normalizedPremiumRequests > 0) {
+			info += `${theme.fg("dim", "Premium Requests:")} ${normalizedPremiumRequests.toLocaleString()}\n`;
+		}
+		if (stats.credits !== undefined) {
+			info += `${theme.fg("dim", "Credits:")} ${formatCreditValue(stats.credits.cost)}\n`;
+			info += `${theme.fg("dim", "Committed Credits:")} ${formatCreditValue(stats.credits.committedCost)}\n`;
+			info += `${theme.fg("dim", "Committed ACU:")} ${formatCreditValue(stats.credits.acuCost)}\n`;
+		}
+	}
+
+	if (services.lspServers && services.lspServers.length > 0) {
+		info += `\n${theme.bold("LSP Servers")}\n`;
+		for (const server of services.lspServers) {
+			const statusColor =
+				server.status === "ready"
+					? "success"
+					: server.status === "available"
+						? "dim"
+						: server.status === "connecting"
+							? "warning"
+							: "error";
+			const statusText =
+				server.status === "error" && server.error ? `${server.status}: ${server.error}` : server.status;
+			info += `${theme.fg("dim", `${server.name}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${server.fileTypes.join(", ")})`)}\n`;
+		}
+	}
+
+	if (services.mcpManager) {
+		const mcpServers = services.mcpManager.getConnectedServers();
+		info += `\n${theme.bold("MCP Servers")}\n`;
+		if (mcpServers.length === 0) {
+			info += `${theme.fg("dim", "None connected")}\n`;
+		} else {
+			for (const name of mcpServers) {
+				const conn = services.mcpManager.getConnection(name);
+				const toolCount = conn?.tools?.length ?? 0;
+				info += `${theme.fg("dim", `${name}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
+			}
+		}
+	}
+	return info;
+}
+
+/** Shared complete job-tree report; the native summary uses JobsSheet instead. */
+export function buildJobsReport(tree: AsyncJobTree, columns: number, full: boolean): string {
+	const now = Date.now();
+	let info = `${theme.fg("dim", "Running:")} ${tree.running.length}\n`;
+	if (tree.running.length === 0 && tree.recent.length === 0) {
+		info += `\n${theme.fg("dim", "No async jobs yet.")}`;
+		return info;
+	}
+
+	// Lines under a row hang off its tree rails. Full mode wraps here so
+	// every line, including heredoc lines and wrap continuations, keeps that
+	// indent inside the report box.
+	info += "\n";
+	for (const row of buildJobTree([...tree.running, ...tree.recent], tree.agents, tree.rootId)) {
+		const guide = theme.fg("dim", jobTreeGuide(row, theme));
+		if (row.kind === "agent") {
+			info += `${guide}${theme.bold(row.agent.id)}\n`;
+			continue;
+		}
+		const { job } = row;
+		// A spawned subagent's task job takes the agent's id as its id and label: name it once.
+		const agent = row.agent && row.agent.id !== job.id ? ` ${theme.bold(row.agent.id)}` : "";
+		info += `${guide}${renderJobLine(job, now)}${agent}\n`;
+		// What the job is for leads; full mode follows it with what the command does and the whole command.
+		const text = full ? (job.command ?? job.label) : (job.intent ?? job.label);
+		if (text === job.id) continue;
+		const indent = jobTreeIndent(row, theme);
+		const prefix = theme.fg("dim", indent);
+		if (!full) {
+			const label = truncateJobLabel(text, Math.max(24, columns - 22 - visibleWidth(indent)));
+			info += `${prefix}${theme.fg("dim", label)}\n`;
+			continue;
+		}
+		for (const line of wrapTextWithAnsi(
+			shortenEmbeddedPaths(replaceTabs(sanitizeText([job.intent, job.caption, text].filter(Boolean).join("\n")))),
+			Math.max(1, columns - 4 - visibleWidth(indent)),
+		)) {
+			info += `${prefix}${theme.fg("dim", line)}\n`;
+		}
+	}
+	return info.trimEnd();
+}
+
+/** Changelog selection, heading and content shared by both presentation hosts. */
+export async function buildChangelogReport(view: ChangelogView): Promise<{ title: string; markdown: string }> {
+	const changelogPath = getChangelogPath();
+	const allEntries = await parseChangelog(changelogPath);
+	const entriesToShow = selectChangelogEntries(allEntries, view);
+	const changelogMarkdown =
+		entriesToShow.length > 0 ? renderChangelogEntries(entriesToShow).markdown : "No changelog entries found.";
+	const shown = entriesToShow.length;
+	const titleCount = shown > 0 ? shown : view.kind === "last" ? view.count : shown;
+	const title =
+		view.kind === "full"
+			? "Full Changelog"
+			: view.kind === "last"
+				? titleCount === 1
+					? "Last Release"
+					: `Last ${titleCount} Releases`
+				: "Recent Changes";
+	const hint =
+		view.kind === "full"
+			? ""
+			: `\n\n${theme.fg("dim", "Use")} ${theme.bold("/changelog full")} ${theme.fg("dim", "to view the complete changelog.")}`;
+	return { title, markdown: changelogMarkdown + hint };
+}
+
+const ADVISOR_STATUS_GLYPH: Record<string, string> = {
+	running: "●",
+	paused: "○",
+	no_model: "○",
+	quota_exhausted: "✕",
+	error: "✕",
+};
+
+const ADVISOR_STATUS_LABEL: Record<string, string> = {
+	running: "running",
+	paused: "off",
+	no_model: "no model",
+	quota_exhausted: "quota exhausted",
+	error: "error",
+};
+
+/** The same account-aware advisor status snapshot used by /advisor status. */
+export function buildAdvisorStatusReport(session: AgentSession): { title: string; text: string } {
+	const stats = session.getAdvisorStats();
+	if (!stats.configured) {
+		return { title: "Advisor Status", text: "Advisor is disabled." };
+	}
+	// Render cached quota data without waiting for the network. Quota lines
+	// are optional, and the refresh below serves the next invocation.
+	const usageProvider = session as {
+		cachedUsageReports?: UsageReport[];
+		fetchUsageReports?: () => Promise<UsageReport[] | null>;
+	};
+	const usageReports: UsageReport[] | null = usageProvider.cachedUsageReports ?? null;
+	// Warm the snapshot for the next invocation. The fetch logs its own
+	// failures, and a missing quota line is non-fatal by design.
+	void usageProvider.fetchUsageReports?.().catch(() => {});
+	// Resolve the active OAuth identity for each advisor's provider so quota
+	// filtering matches the credential actually in use (not sibling accounts).
+	const resolveActiveAdvisorAccount = (provider: string, sessionId?: string): OAuthAccountIdentity | undefined =>
+		session.modelRegistry.authStorage.oauth.identity(provider, sessionId ?? session.sessionId);
+	const nowMs = Date.now();
+	// Roster view: show every configured advisor with its status, even when
+	// none are live (all paused/no-model). The old code returned a generic
+	// message that hid the per-advisor state the user needs to act on.
+	if (stats.advisors.length > 1 || (stats.configured && !stats.active)) {
+		let info = "";
+		for (const a of stats.advisors) {
+			const glyph = ADVISOR_STATUS_GLYPH[a.status] ?? "?";
+			const label = ADVISOR_STATUS_LABEL[a.status] ?? a.status;
+			const color =
+				a.status === "running"
+					? "success"
+					: a.status === "quota_exhausted" || a.status === "error"
+						? "error"
+						: "dim";
+			info += `\n${theme.fg(color, glyph)} ${theme.bold(a.name)} ${theme.fg("dim", `[${label}]`)}\n`;
+			if (a.model) {
+				info += `${theme.fg("dim", "Model:")} ${a.model.provider}/${a.model.id}\n`;
+			}
+			if (a.model && usageReports) {
+				const identity = resolveActiveAdvisorAccount(a.model.provider, a.sessionId);
+				const quota = formatCompactQuota(
+					a.model.provider,
+					collapseSharedUsageReports(usageReports),
+					nowMs,
+					(report, limit) => !identity || limitMatchesActiveAccount(report, limit, identity),
+				);
+				if (quota) info += `${theme.fg("dim", quota)}\n`;
+			}
+			if (a.status === "running" || a.status === "quota_exhausted") {
+				const ctx =
+					a.contextWindow > 0
+						? `${a.contextTokens.toLocaleString()} / ${a.contextWindow.toLocaleString()} (${Math.round((a.contextTokens / a.contextWindow) * 100)}%)`
+						: `${a.contextTokens.toLocaleString()}`;
+				info += `${theme.fg("dim", "Context:")} ${ctx}\n`;
+				info += `${theme.fg("dim", "Messages:")} ${a.messages.total.toLocaleString()}\n`;
+				info += `${theme.fg("dim", "Spend:")} ${a.tokens.input.toLocaleString()} in / ${a.tokens.output.toLocaleString()} out`;
+				if (a.cost > 0) info += `, $${a.cost.toFixed(4)}`;
+				info += "\n";
+			}
+		}
+		if (stats.active) {
+			info += `\n${theme.bold("Totals")}\n`;
+			info += `${theme.fg("dim", "Tokens:")} ${stats.tokens.total.toLocaleString()}\n`;
+			if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
+		}
+		return { title: `Advisor Status (${stats.advisors.length} advisors)`, text: info.trim() };
+	}
+	// Single active advisor — detailed view.
+	const model = stats.model;
+	let info = "";
+	if (stats.advisors.length === 1) {
+		const a = stats.advisors[0];
+		const glyph = ADVISOR_STATUS_GLYPH[a.status] ?? "?";
+		const label = ADVISOR_STATUS_LABEL[a.status] ?? a.status;
+		info += `${theme.fg(a.status === "running" ? "success" : "error", glyph)} ${a.name} ${theme.fg("dim", `[${label}]`)}\n\n`;
+	}
+	if (model) {
+		info += `${theme.bold("Provider")}\n`;
+		info += `${theme.fg("dim", "Model:")} ${model.provider}/${model.id}\n`;
+	}
+	if (model && usageReports) {
+		const identity = resolveActiveAdvisorAccount(model.provider, stats.advisors[0]?.sessionId);
+		const quota = formatCompactQuota(
+			model.provider,
+			collapseSharedUsageReports(usageReports),
+			nowMs,
+			(report, limit) => !identity || limitMatchesActiveAccount(report, limit, identity),
+		);
+		if (quota) {
+			info += `\n${theme.bold("Quota")}\n`;
+			info += `${theme.fg("dim", quota)}\n`;
+		}
+	}
+	info += `\n${theme.bold("Messages")}\n`;
+	info += `${theme.fg("dim", "User:")} ${stats.messages.user.toLocaleString()}\n`;
+	info += `${theme.fg("dim", "Assistant:")} ${stats.messages.assistant.toLocaleString()}\n`;
+	info += `${theme.fg("dim", "Total:")} ${stats.messages.total.toLocaleString()}\n`;
+	info += `\n${theme.bold("Context")}\n`;
+	if (stats.contextWindow > 0) {
+		const percent = Math.round((stats.contextTokens / stats.contextWindow) * 100);
+		info += `${theme.fg("dim", "Tokens:")} ${stats.contextTokens.toLocaleString()} / ${stats.contextWindow.toLocaleString()} (${percent}%)\n`;
+	} else {
+		info += `${theme.fg("dim", "Tokens:")} ${stats.contextTokens.toLocaleString()}\n`;
+	}
+	info += `\n${theme.bold("Spend")}\n`;
+	info += `${theme.fg("dim", "Input:")} ${stats.tokens.input.toLocaleString()}\n`;
+	info += `${theme.fg("dim", "Output:")} ${stats.tokens.output.toLocaleString()}\n`;
+	if (stats.tokens.cacheRead > 0) {
+		info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
+	}
+	if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
+	return { title: "Advisor Status", text: info.trim() };
 }

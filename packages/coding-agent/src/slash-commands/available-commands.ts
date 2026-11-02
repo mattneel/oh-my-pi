@@ -17,6 +17,8 @@ export interface InternalAvailableSlashCommand {
 	input?: { hint: string };
 	subcommands?: Array<{ name: string; description?: string; usage?: string }>;
 	source: AvailableSlashCommandSource;
+	/** A genuine viewer-local screen is available on the negotiated presentation channel. */
+	screen?: boolean;
 }
 
 export interface AvailableCommandsSession {
@@ -34,6 +36,7 @@ export async function buildAvailableSlashCommands(
 	session: AvailableCommandsSession,
 	loadFileCommands: (cwd: string) => Promise<FileSlashCommand[]> = cwd =>
 		loadSlashCommands({ cwd, extensionRoots: session.effectiveExtensionRoots }),
+	options: { screenCommands?: ReadonlySet<string> } = {},
 ): Promise<InternalAvailableSlashCommand[]> {
 	const commands: InternalAvailableSlashCommand[] = [];
 	const seenNames = new Set<string>();
@@ -44,7 +47,8 @@ export async function buildAvailableSlashCommands(
 	};
 
 	for (const command of BUILTIN_SLASH_COMMANDS_INTERNAL) {
-		if (!command.handle) continue;
+		const screen = options.screenCommands?.has(command.name) ?? false;
+		if (!command.handle && !screen) continue;
 		const hint = command.acpInputHint ?? command.inlineHint;
 		appendCommand({
 			name: command.name,
@@ -53,7 +57,20 @@ export async function buildAvailableSlashCommands(
 			input: hint ? { hint } : undefined,
 			subcommands: command.subcommands,
 			source: "builtin",
+			...(screen ? { screen: true } : {}),
 		});
+		if (screen) {
+			for (const alias of command.aliases ?? []) {
+				appendCommand({
+					name: alias,
+					description: command.acpDescription ?? command.description,
+					input: hint ? { hint } : undefined,
+					subcommands: command.subcommands,
+					source: "builtin",
+					screen: true,
+				});
+			}
+		}
 		// ACP dispatch resolves builtin aliases before `session.prompt()` sees the
 		// input, so a custom/file command sharing an alias would be advertised but
 		// never run. Reserve aliases here too; TUI-only builtins are skipped above,
@@ -114,5 +131,6 @@ export function toAcpAvailableCommands(commands: readonly InternalAvailableSlash
 		name: command.name,
 		description: command.description ?? "",
 		input: command.input,
+		...(command.screen ? { _meta: { "omp/screen": true } } : {}),
 	}));
 }

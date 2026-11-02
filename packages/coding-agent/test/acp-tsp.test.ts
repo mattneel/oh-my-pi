@@ -1030,6 +1030,169 @@ describe.skipIf(process.platform === "win32")("ACP TSP side channel", () => {
 		}
 	}, 60_000);
 
+	it("opens the full Models command per viewer, reports assignments once and refuses non-screen invocations", async () => {
+		const { cwd, env } = await isolatedEnvironment();
+		const modelsFile = path.join(env.PI_CODING_AGENT_DIR!, "models.yml");
+		const models = JSON.parse(await Bun.file(modelsFile).text());
+		models.providers["acp-fixture"].models.push({
+			...models.providers["acp-fixture"].models[0],
+			id: "transcript-screen",
+			name: "Native screen alternate",
+		});
+		await Bun.write(modelsFile, JSON.stringify(models));
+		const sessionId = await seedSession(cwd, env, 0);
+		const socketPath = path.join(cwd, "screen-command.sock");
+		const listener = await listen(socketPath);
+		const proc = new CliProcess(["acp", "--tsp", socketPath], cwd, env);
+		const host = new SideChannel(await listener.connection, ["blobs", "settle", "dock", "viewers", "keys"]);
+		await initializeAndLoad(proc, cwd, sessionId);
+		const shared = host.surface!;
+		const transcript = await host.waitForNode(
+			node => node.k === "md" && node.p?.text === "Saved assistant transcript",
+			shared,
+		);
+		const advertised = await proc.changes.wait("negotiated viewer screen command metadata", () => {
+			for (const message of proc.messages) {
+				const update = message.params?.update;
+				if (!isRecord(update) || update.sessionUpdate !== "available_commands_update") continue;
+				if (Array.isArray(update.availableCommands)) return update.availableCommands.filter(isRecord);
+			}
+			return undefined;
+		});
+		for (const name of [
+			"model",
+			"models",
+			"context",
+			"usage",
+			"agents",
+			"git",
+			"hub",
+			"switch",
+			"effort",
+			"settings",
+			"login",
+			"logout",
+			"tools",
+			"hotkeys",
+			"changelog",
+			"session",
+			"jobs",
+			"advisor",
+			"memory",
+		]) {
+			expect(advertised.find(command => command.name === name)?._meta).toEqual({ "omp/screen": true });
+		}
+		for (const name of ["resume", "branch", "tree", "move", "seance", "pause", "plan-review", "live", "local"]) {
+			const metadata = advertised.find(command => command.name === name)?._meta;
+			expect(isRecord(metadata) ? metadata["omp/screen"] : undefined).toBeUndefined();
+		}
+		const reply = (id: string) =>
+			host.changes.wait(`screen command reply ${id}`, () => {
+				const message = host.log.find(
+					message =>
+						message.verb === "r" &&
+						isRecord(message.body) &&
+						message.body.r === "command" &&
+						message.body.id === id,
+				);
+				return message && isRecord(message.body) ? message.body : undefined;
+			});
+		const updates = () =>
+			proc.messages.filter(message => {
+				const update = message.params?.update;
+				return isRecord(update) && update.sessionUpdate === "config_option_update";
+			});
+		// Ordinary ACP slash prompts retain their behavior and record real MRU history.
+		const selected = await proc.request("session/prompt", {
+			sessionId,
+			prompt: [{ type: "text", text: "/model acp-fixture/transcript" }],
+		});
+		expect(selected.error).toBeUndefined();
+		const chip = await host.waitForNode(node => node.p?.role === "omp.composer.model", shared);
+		host.event({ ev: "action", sf: shared, id: chip.id, act: "model", viewer: "window-b" });
+		const other = await host.changes.wait("viewer B quick switcher", () => viewerOpens(host, "window-b")[0]);
+		const quick = await host.waitForNode(node => node.k === "picker", other);
+		expect(quick.p?.role).not.toBe("omp.overlay.model-hub");
+		host.event({ ev: "key", sf: other, viewer: "window-b", data: "transcript" });
+		await host.waitForNode(node => node.k === "picker" && node.p?.query === "transcript", other);
+		// No surface/node id is needed for a document-level, authenticated viewer command.
+		host.event({ ev: "command", name: "model", args: "", viewer: "window-a", id: "models-full" });
+		const opened = await reply("models-full");
+		expect(opened).toMatchObject({ r: "command", name: "model", viewer: "window-a", ok: true });
+		if (typeof opened.sf !== "string") throw new Error("Full Models command omitted its viewer surface");
+		const surface = opened.sf;
+		expect(surface).toMatch(/^v\.window-a\./);
+		const screen = await host.waitForNode(
+			node => node.k === "picker" && node.p?.role === "omp.overlay.model-hub",
+			surface,
+		);
+		if (screen.k !== "picker") throw new Error("Models command did not emit the full native screen");
+		expect(screen.p?.title).toBe("Models");
+		expect(screen.p?.scopes?.map(scope => scope.id)).toEqual(
+			expect.arrayContaining(["roles", "all", "provider:acp-fixture"]),
+		);
+		expect(screen.p?.scopes?.some(scope => scope.group === "Not signed in")).toBe(true);
+		expect(screen.p?.tabs?.map(tab => tab.label)).toEqual(
+			expect.arrayContaining(["All", "Chat", "Tiny", "Image", "TTS", "STT", "Search", "Judge", "Embedding"]),
+		);
+		for (const label of ["Int", "t/s", "Ctx", "$/M", "Recent", "Assign role"])
+			expect(JSON.stringify(screen.p)).toContain(label);
+		expect(viewerOpens(host, "window-b")).toHaveLength(1);
+		expect(host.find(node => node.k === "picker" && node.p?.role === "omp.overlay.model-hub", other)).toBeUndefined();
+		expect(host.find(node => node.k === "picker", other)?.p).toHaveProperty("query", "transcript");
+		const baseline = updates().length;
+		host.event({
+			ev: "activate",
+			sf: surface,
+			id: screen.id,
+			item: "acp-fixture/transcript-screen",
+			viewer: "window-a",
+		});
+		const assigning = await host.waitForNode(
+			node => node.k === "picker" && node.p?.strip?.items.some(item => item.label === "default") === true,
+			surface,
+		);
+		if (assigning.k !== "picker") throw new Error("Models assignment strip disappeared");
+		const role = assigning.p?.strip?.items.find(item => item.label === "default");
+		if (!role) throw new Error("Models screen omitted Assign default role");
+		host.event({ ev: "action", sf: surface, id: assigning.id, act: "strip", value: role.id, viewer: "window-a" });
+		await proc.changes.wait("one full Models assignment config update", () =>
+			updates().length > baseline ? true : undefined,
+		);
+		await host.waitForNode(
+			node => node.k === "text" && wireText(node.p?.spans).includes("Native screen alternate"),
+			shared,
+		);
+		expect(updates()).toHaveLength(baseline + 1);
+		expect(host.find(node => node.id === transcript.id, shared)).toBeDefined();
+		expect(host.find(node => node.k === "picker", other)?.p).toHaveProperty("query", "transcript");
+		for (const [id, name, args] of [
+			["unknown-screen", "definitely-not-a-screen", ""],
+			["lifecycle-screen", "resume", ""],
+			["model-argument", "model", "acp-fixture/transcript"],
+			["effort-argument", "effort", "high"],
+		]) {
+			const openCount = viewerOpens(host, "window-a").length;
+			host.event({ ev: "command", sf: shared, name, args, viewer: "window-a", id });
+			const refused = await reply(id);
+			expect(refused).toMatchObject({ r: "command", name, viewer: "window-a", ok: false });
+			expect(refused.error).toContain(name);
+			// Refusal never starts a model turn or touches another viewer's component.
+			expect(host.find(node => node.k === "picker", other)?.p).toHaveProperty("query", "transcript");
+			if (name === "definitely-not-a-screen" || name === "resume") {
+				expect(viewerOpens(host, "window-a")).toHaveLength(openCount);
+			}
+		}
+		expect(updates()).toHaveLength(baseline + 1);
+		host.assertValid();
+		const closed = await proc.request("session/close", { sessionId });
+		expect(closed.error).toBeUndefined();
+		await gracefulShutdown(proc, host);
+		expect(await Bun.file(path.join(env.PI_CODING_AGENT_DIR!, "config.yml")).text()).toContain(
+			"acp-fixture/transcript-screen",
+		);
+	}, 90_000);
+
 	it("opens context, usage, and git from emitted dock actions only in the requesting viewer", async () => {
 		const { cwd, env } = await isolatedEnvironment();
 		const modelsFile = path.join(env.PI_CODING_AGENT_DIR!, "models.yml");

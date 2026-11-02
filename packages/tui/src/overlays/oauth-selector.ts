@@ -21,7 +21,7 @@ import type { TspPickerAction, TspPickerItem, TspSpan, TspText, TspTone } from "
 import { node, span, text } from "../native/describe";
 import type { DescribeContext, NativeNode, NativeUiEvent } from "../native/node";
 import { CLOSE_ACTION, dockedPicker, PICKER_KEY, pickerAction, pickerEvent, pickerQuery } from "../native/picker";
-import { overlayCard } from "../native/overlay";
+import { actionBar, actionButton, overlayCard } from "../native/overlay";
 import { isNativeRendering } from "../native/state";
 
 const OAUTH_SELECTOR_MAX_VISIBLE = 10;
@@ -133,6 +133,11 @@ export class OAuthSelectorComponent extends OverlayPanel {
 	stopValidation(): void {
 		this.#validationGeneration += 1;
 		this.#stopSpinner();
+	}
+
+	override dispose(): void {
+		this.stopValidation();
+		super.dispose();
 	}
 
 	/** Replace the native sheet's presentation (a new outcome line, a relabelled leave action). */
@@ -622,12 +627,18 @@ export class OAuthSelectorComponent extends OverlayPanel {
 			),
 		);
 		if (this.#statusMessage) children.push(text([span(this.#statusMessage, "warning")]));
+		children.push(actionBar([null, actionButton("Close", "close", { keys: "escape" })]));
 		this.#nativeRoot = overlayCard(this.nativeRole, this.title, children);
 		return this.#nativeRoot;
 	}
 
 	/** A click (or double-click) on a provider selects and confirms it, like the SGR click in {@link routeMouse}. */
 	handleNativeEvent(event: NativeUiEvent): void {
+		if (event.type === "action" && (event.act === "close" || event.act === "cancel")) {
+			this.stopValidation();
+			this.#onCancelCallback();
+			return;
+		}
 		const ev = pickerEvent(event, PICKER_KEY);
 		if (ev?.kind === "action") {
 			if (ev.act === "confirm") this.#confirmSelection();

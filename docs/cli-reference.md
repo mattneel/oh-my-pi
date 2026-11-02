@@ -336,6 +336,54 @@ is a key sequence of at most 4 KiB. Keys never go to ACP stdin. Ordinary
 events; actions can carry `item`, `values` and object-valued `value`.
 Folding, copying, opening links and zooming stay local to the window.
 
+#### Viewer screen commands
+
+With `viewers`, `available_commands_update` marks real window-local screen
+commands with `_meta: {"omp/screen": true}`. Send a TSP event, not a prompt:
+
+```json
+{"ev":"command","name":"model","args":"","viewer":"window-a","id":"request-7"}
+```
+
+`args` is the raw argument string (required, possibly empty); `id` is an optional
+opaque correlation ID. An omitted or empty `sf` targets the active shared
+document; a named surface must exist and belong to that viewer if viewer-scoped.
+The asynchronous reply uses verb `r` and preserves `name`, `viewer` and `id`:
+
+```json
+{"r":"command","name":"model","viewer":"window-a","id":"request-7","ok":true,"sf":"v.window-a.3"}
+{"r":"command","name":"resume","viewer":"window-a","id":"request-8","ok":false,"error":"Command \"resume\" refused: Unknown screen command: resume"}
+```
+
+Success means a real component mounted on the returned viewer surface. Refusal
+names the command and never starts a prompt. `/model` opens the full Models
+screen: role management, all providers, category tabs, metric columns, Recent,
+details and Assign role. The dock model chip and `/switch` keep the compact
+session switcher. Settings and role assignments persist through the same
+interactive policies; model/effort changes produce the existing ACP config
+updates once, keeping all windows synchronized.
+
+The advertised canonical names and screen argument forms are:
+
+| Command | Screen arguments |
+| --- | --- |
+| `model` (`models`), `context`, `agents`, `hub` (`subagents`), `switch`, `effort`, `settings`, `tools`, `hotkeys` | none |
+| `usage` | none or `show` |
+| `git` | optional Git revision |
+| `login`, `logout` | optional OAuth provider ID |
+| `changelog` | none, `full`, or `last [positive N]` |
+| `session` | none or `info` |
+| `jobs` | none or `full`; read-only inspection, not cancellation |
+| `advisor` | `status` only |
+| `memory` | none, `view`, `queue`, `stats`, or `diagnose` |
+
+Other argument forms are explicitly refused. Lifecycle/external commands such
+as resume, rewind, tree, move, seance, pause, plan-review, live and the local
+editor are not viewer screen commands. Setup, extensions, MCP and SSH remain on
+their existing paths because they need additional interactive/runtime services.
+Ordinary typed slash commands sent over ACP retain their existing behavior;
+the host decides whether a refused argument form should fall back to that path.
+
 Stop, approvals and questions **still complete through ACP only**. The host
 intercepts `interrupt` and cancels through ACP. A pending
 `session/request_permission` sets its tool card to `status:"ask"` with

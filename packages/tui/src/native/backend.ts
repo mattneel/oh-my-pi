@@ -52,7 +52,14 @@ import {
 	type TspReaderLimits,
 	splitTspMessage,
 } from "./encode";
-import type { DescribeContext, NativeChild, NativeNode, NativeSurface, NativeUiEvent } from "./node";
+import type {
+	DescribeContext,
+	NativeChild,
+	NativeCommandEvent,
+	NativeNode,
+	NativeSurface,
+	NativeUiEvent,
+} from "./node";
 import { NARROW_SHEET_COLS } from "./overlay";
 import { nativeComponentId, Reconciler } from "./reconcile";
 import { setNativeButtons, setNativeRendering } from "./state";
@@ -95,6 +102,8 @@ export interface NativeHost {
 	invalidate(): void;
 	/** A trusted host reports a browser window leaving (viewer extension only). */
 	viewerLeft?(viewer: string): void;
+	/** Open a viewer-local screen and return its surface id; reject unsupported or refused commands. */
+	handleCommand?(event: NativeCommandEvent): Promise<string> | string;
 }
 
 export interface NativeBackendOptions {
@@ -318,6 +327,8 @@ export class NativeBackend {
 	#recent: TspFrame[] = [];
 	#sawResize = false;
 	#live = false;
+	/** Invalidates command completions across stop/start or resume cycles. */
+	#commandEpoch = 0;
 	#overlayNodes = new Map<Component, { key: string; node: NativeNode }>();
 	/** Pending delivery owns bytes until sent or confirmed held; settled descriptions may already be released. */
 	#blobs = new Map<string, NativeBlob | "sent">();
@@ -407,6 +418,7 @@ export class NativeBackend {
 	 * `keep` is false (a revoked optimistic start: rows repaint from scratch).
 	 */
 	stop(keep = true): void {
+		this.#commandEpoch++;
 		this.#reader.clear();
 		if (!this.#live) return;
 		this.#live = false;
@@ -776,7 +788,7 @@ export class NativeBackend {
 		}
 	}
 
-	#write(verb: "o" | "f" | "x" | "q", body: unknown): void {
+	#write(verb: "o" | "f" | "x" | "q" | "r", body: unknown): void {
 		this.#record("out", verb, undefined, body);
 		this.#host.terminal.write(encodeTspJson(verb, body, undefined, this.#limit));
 	}
@@ -806,6 +818,15 @@ export class NativeBackend {
 	}
 
 	#handleEvent(event: TspEvent): void {
+		// Commands have their own refusal reply, including foreign or stale audiences.
+		if (event.ev === "command") {
+			if (this.#live && this.#cx.feature("viewers")) {
+				void this.#handleCommand(event).catch(error => {
+					logger.warn("TSP: command reply failed", { name: event.name, error: String(error) });
+				});
+			}
+			return;
+		}
 		// ACKs belong to the authoritative document host, not a browser window.
 		// Every window-originated event must match the audience of its surface.
 		const sf = "sf" in event ? event.sf : undefined;
@@ -902,6 +923,37 @@ export class NativeBackend {
 				return;
 			}
 		}
+	}
+
+	async #handleCommand(event: NativeCommandEvent): Promise<void> {
+		const epoch = this.#commandEpoch;
+		const reply = {
+			r: "command" as const,
+			name: event.name,
+			viewer: event.viewer,
+			...(event.id === undefined ? {} : { id: event.id }),
+		};
+		let result: { ok: true; sf: string } | { ok: false; error: string };
+		try {
+			const sf = event.sf || (this.#screen ?? this.#inline).id;
+			const surface = this.#surfaceFor(sf);
+			const audience = this.#viewers.get(sf);
+			if (!surface || (audience && audience.viewer !== event.viewer)) {
+				throw new Error("surface is unknown or belongs to another viewer");
+			}
+			if (!this.#host.handleCommand) throw new Error("unsupported or unknown command");
+			const opened = await this.#host.handleCommand({ ...event, sf });
+			if (!this.#live || epoch !== this.#commandEpoch || !this.#cx.feature("viewers")) return;
+			if (this.#viewers.get(opened)?.viewer !== event.viewer) {
+				throw new Error("handler did not open a surface for this viewer");
+			}
+			result = { ok: true, sf: opened };
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			result = { ok: false, error: `Command ${JSON.stringify(event.name)} refused: ${detail}` };
+		}
+		if (!this.#live || epoch !== this.#commandEpoch || !this.#cx.feature("viewers")) return;
+		this.#write("r", { ...reply, ...result });
 	}
 
 	#routeUiEvent(

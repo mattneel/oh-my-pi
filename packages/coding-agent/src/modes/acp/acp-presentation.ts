@@ -85,6 +85,10 @@ export class AcpPresentation {
 			},
 			requestRender: () => this.requestRender(),
 			viewerLeft: viewer => this.#cockpit?.viewerLeft(viewer),
+			handleCommand: event => {
+				if (!this.#cockpit) throw new Error(`No active session for screen command ${JSON.stringify(event.name)}`);
+				return this.#cockpit.handleCommand(event);
+			},
 			appearanceChanged: dark => {
 				onTerminalAppearanceChange(dark ? "dark" : "light");
 				this.#builder?.container.invalidate();
@@ -117,6 +121,10 @@ export class AcpPresentation {
 			logger.warn("ACP TSP peer disconnected; ACP control remains active");
 			void this.close();
 		});
+	}
+
+	get supportsViewerCommands(): boolean {
+		return this.#viewersEnabled && !this.#closed;
 	}
 
 	/** Select the most recently created, loaded, resumed, forked or prompted ACP session. */

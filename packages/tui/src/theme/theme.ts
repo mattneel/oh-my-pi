@@ -275,10 +275,13 @@ export async function setTheme(
 export async function previewTheme(
 	name: string,
 	event: ThemeChangeEvent = { ephemeral: true },
+	signal?: AbortSignal,
 ): Promise<{ success: boolean; error?: string }> {
+	if (signal?.aborted) return { success: false, error: "Theme preview cancelled" };
 	const requestId = ++themeLoadRequestId;
 	try {
 		const loadedTheme = await loadTheme(name, getCurrentThemeOptions());
+		if (signal?.aborted) return { success: false, error: "Theme preview cancelled" };
 		if (requestId !== themeLoadRequestId) {
 			return { success: false, error: "Theme preview superseded by a newer request" };
 		}

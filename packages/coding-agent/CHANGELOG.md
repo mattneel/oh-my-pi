@@ -9,6 +9,7 @@
 - ACP cockpit transcripts preserve durable assistant and Yard turn keys across reload/replay, separate explicit Yard context from visible messages, and retain complete folded tool content.
 - ACP advertises `omp/settledResponses`: session startup and all prompt responses wait for cleanup, turn updates and client callback results, allowing safe live-connection handoff.
 - ACP cockpit context, cost and Git status actions open their real native Context, Usage and Git pages independently per viewer, with Close/Escape controls and session-scoped data.
+- ACP viewer screen commands advertise `omp/screen` metadata and open the full Models screen, portable settings/auth/configuration hubs and reports without turning window-local commands into prompts.
 
 ### Fixed
 

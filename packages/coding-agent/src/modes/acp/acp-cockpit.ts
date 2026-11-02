@@ -2,7 +2,13 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { describeWorkingRow, type WorkingRowSpec } from "@oh-my-pi/pi-tui/components/loader";
 import type { NativeBackend } from "@oh-my-pi/pi-tui/native/backend";
 import { node } from "@oh-my-pi/pi-tui/native/describe";
-import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
+import type {
+	DescribeContext,
+	NativeChild,
+	NativeCommandEvent,
+	NativeNode,
+	NativeUiEvent,
+} from "@oh-my-pi/pi-tui/native/node";
 import type { TspTransport } from "@oh-my-pi/pi-tui/native/transport";
 import { AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import type { AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
@@ -27,6 +33,7 @@ import { createStatusLineHost, type StatusLineHostSession } from "../status-line
 import { AcpViewerHost } from "./acp-viewer-host";
 import { getAcpInteractionProjection } from "./acp-interactions";
 import { openAcpContext, openAcpUsage } from "./acp-status-overlays";
+import { type AcpDockAction, getAcpScreenCommand } from "./acp-screen-commands";
 
 export interface AcpPresentationRuntime {
 	eventBus?: EventBusLike;
@@ -175,6 +182,39 @@ export class AcpCockpit implements Component {
 		return node("col", { role: "omp.dock", gap: "xs" }, children);
 	}
 
+	async handleCommand(event: NativeCommandEvent): Promise<string> {
+		if (this.#disposed) throw new Error(`Screen command ${JSON.stringify(event.name)} has no active session`);
+		const open = getAcpScreenCommand(event.name);
+		if (!open) throw new Error(`Unknown screen command: ${event.name}`);
+		const { viewer, done } = this.#createViewer(event.viewer);
+		let failure: unknown;
+		try {
+			const pending = open(
+				{
+					viewer,
+					session: this.session,
+					onClose: done,
+					openDockAction: (action, args) => this.#openDockAction(action, viewer, done, args),
+				},
+				event.args,
+			);
+			if (pending) {
+				void pending.catch(error => {
+					failure = error;
+					if (!viewer.closed) logger.warn("ACP screen command failed", { name: event.name, error: String(error) });
+					done();
+				});
+			}
+			if (!(await viewer.ready) || viewer.closed) {
+				throw failure ?? new Error(`Screen command ${JSON.stringify(event.name)} closed before opening`);
+			}
+			return viewer.surface;
+		} catch (error) {
+			done();
+			throw error;
+		}
+	}
+
 	handleNativeEvent(event: NativeUiEvent): void {
 		// Stop, approvals and question answers are intercepted by the host and completed over ACP.
 		if (this.#disposed || event.type !== "action" || !event.viewer) return;
@@ -189,12 +229,21 @@ export class AcpCockpit implements Component {
 			action !== "status.git"
 		)
 			return;
-		this.viewerLeft(event.viewer);
-		const viewer = new AcpViewerHost(this.transport, this.backend, event.viewer, this.requestRender);
-		this.#viewers.set(event.viewer, viewer);
+		const { viewer, done } = this.#createViewer(event.viewer);
+		this.#openDockAction(action, viewer, done);
+	}
+
+	#createViewer(viewerId: string): { viewer: AcpViewerHost; done: () => void } {
+		this.viewerLeft(viewerId);
+		const viewer = new AcpViewerHost(this.transport, this.backend, viewerId, this.requestRender);
+		this.#viewers.set(viewerId, viewer);
 		const done = () => {
-			if (this.#viewers.get(event.viewer!) === viewer) this.viewerLeft(event.viewer!);
+			if (this.#viewers.get(viewerId) === viewer) this.viewerLeft(viewerId);
 		};
+		return { viewer, done };
+	}
+
+	#openDockAction(action: AcpDockAction, viewer: AcpViewerHost, done: () => void, args = ""): void {
 		if (action === "status.context") openAcpContext(viewer, this.session, done);
 		else if (action === "status.cost") {
 			void openAcpUsage(viewer, this.session, done).catch(error => {
@@ -202,7 +251,7 @@ export class AcpCockpit implements Component {
 				done();
 			});
 		} else if (action === "status.git") {
-			void showGitOverlay(viewer, { cwd: this.session.sessionManager.getCwd() })
+			void showGitOverlay(viewer, { cwd: this.session.sessionManager.getCwd(), revision: args.trim() || undefined })
 				.catch(error => logger.warn("ACP git overlay failed", { error: String(error) }))
 				.finally(done);
 		} else if (action === "model") this.#modelPicker(viewer, done);

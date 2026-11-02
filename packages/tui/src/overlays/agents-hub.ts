@@ -21,7 +21,6 @@ import {
 	replaceTabs,
 	routeSgrMouseInput,
 	type SgrMouseEvent,
-	type TUI,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
@@ -130,8 +129,14 @@ export interface AgentsHubDeps {
 	setAgentDisabled: (name: string, options: { disabled: boolean }) => void;
 	/** Persist one agent's override for `property`; `undefined` clears it. Other agents are untouched. */
 	setAgentOverride: (property: PropertyKind, name: string, value: string | undefined) => void;
-	generateAgent: (description: string, onText: (text: string) => void) => Promise<string>;
+	generateAgent: (description: string, onText: (text: string) => void, signal?: AbortSignal) => Promise<string>;
 	saveAgent: (scope: "project" | "user", spec: GeneratedAgentSpec) => Promise<string>;
+}
+
+/** Rendering capabilities shared by terminal and viewer-local hosts. */
+export interface AgentsHubHost {
+	requestRender(): void;
+	terminal?: { readonly rows?: number };
 }
 
 export interface AgentsHubCallbacks {
@@ -208,7 +213,8 @@ function matchAgent(agent: HubAgent, tokens: readonly FuzzyQuery[]): boolean {
  * {@link AgentsHubComponent.dispose} when the overlay closes.
  */
 export class AgentsHubComponent implements Component {
-	#tui: TUI;
+	#tui: AgentsHubHost;
+	readonly #lifetime = new AbortController();
 	#deps: AgentsHubDeps;
 	#callbacks: AgentsHubCallbacks;
 
@@ -277,7 +283,7 @@ export class AgentsHubComponent implements Component {
 	/** First agent-list row's offset in body-line coordinates (after the status row). */
 	#listRowStart = 2;
 
-	private constructor(tui: TUI, deps: AgentsHubDeps, callbacks: AgentsHubCallbacks) {
+	private constructor(tui: AgentsHubHost, deps: AgentsHubDeps, callbacks: AgentsHubCallbacks) {
 		this.#tui = tui;
 		this.#deps = deps;
 		this.#callbacks = callbacks;
@@ -290,7 +296,7 @@ export class AgentsHubComponent implements Component {
 	}
 
 	static async create(
-		tui: TUI,
+		tui: AgentsHubHost,
 		deps: AgentsHubDeps,
 		callbacks: AgentsHubCallbacks = { onCancel: () => {} },
 	): Promise<AgentsHubComponent> {
@@ -299,7 +305,10 @@ export class AgentsHubComponent implements Component {
 		return hub;
 	}
 
-	dispose(): void {}
+	dispose(): void {
+		this.#lifetime.abort();
+		this.#createInput = null;
+	}
 	invalidate(): void {
 		this.#nativeVersion++;
 		this.#frame.invalidate();
@@ -307,6 +316,7 @@ export class AgentsHubComponent implements Component {
 
 	/** Request a repaint after a state change, invalidating the described node. */
 	#requestRender(): void {
+		if (this.#lifetime.signal.aborted) return;
 		this.#nativeVersion++;
 		this.#tui.requestRender();
 	}
@@ -319,7 +329,9 @@ export class AgentsHubComponent implements Component {
 		this.#loadError = null;
 		try {
 			const selectedName = this.#selectedAgent()?.name;
-			this.#allAgents = (await this.#deps.loadAgents()).sort((a, b) => {
+			const agents = await this.#deps.loadAgents();
+			if (this.#lifetime.signal.aborted) return;
+			this.#allAgents = agents.sort((a, b) => {
 				const sourceCmp = SOURCE_ORDER[a.source] - SOURCE_ORDER[b.source];
 				return sourceCmp !== 0 ? sourceCmp : a.name.localeCompare(b.name);
 			});
@@ -331,6 +343,7 @@ export class AgentsHubComponent implements Component {
 			}
 			this.#clampRowIndex();
 		} catch (error) {
+			if (this.#lifetime.signal.aborted) return;
 			this.#allAgents = [];
 			this.#buildSidebar();
 			this.#buildRows();
@@ -675,9 +688,11 @@ export class AgentsHubComponent implements Component {
 		this.#requestRender();
 		try {
 			const spec = await this.#runAgentCreationArchitect(description);
+			if (this.#lifetime.signal.aborted) return;
 			this.#createSpec = spec;
 			this.#notice = null;
 		} catch (error) {
+			if (this.#lifetime.signal.aborted) return;
 			this.#createError = error instanceof Error ? error.message : String(error);
 		} finally {
 			this.#createGenerating = false;
@@ -686,10 +701,15 @@ export class AgentsHubComponent implements Component {
 	}
 
 	async #runAgentCreationArchitect(description: string): Promise<GeneratedAgentSpec> {
-		const raw = await this.#deps.generateAgent(description, text => {
-			this.#createStreamingText += text;
-			this.#requestRender();
-		});
+		const raw = await this.#deps.generateAgent(
+			description,
+			text => {
+				if (this.#lifetime.signal.aborted) return;
+				this.#createStreamingText += text;
+				this.#requestRender();
+			},
+			this.#lifetime.signal,
+		);
 		return parseGeneratedAgentSpec(raw);
 	}
 
@@ -697,6 +717,7 @@ export class AgentsHubComponent implements Component {
 		const spec = this.#createSpec;
 		if (!spec) return;
 		const filePath = await this.#deps.saveAgent(this.#createScope, spec);
+		if (this.#lifetime.signal.aborted) return;
 		this.#clearCreateFlow();
 		this.#notice = `Created agent ${spec.identifier} at ${shortenPath(filePath)}`;
 		await this.#reload();
@@ -707,6 +728,7 @@ export class AgentsHubComponent implements Component {
 	// ═══════════════════════════════════════════════════════════════════════
 
 	handleInput(data: string): void {
+		if (this.#lifetime.signal.aborted) return;
 		this.#nativeVersion++;
 		if (data.startsWith("\x1b[<")) {
 			routeSgrMouseInput(data, event => this.#routeMouseEvent(event));
@@ -1300,6 +1322,7 @@ export class AgentsHubComponent implements Component {
 	}
 
 	handleNativeEvent(event: NativeUiEvent): void {
+		if (this.#lifetime.signal.aborted) return;
 		const target = event.key.slice(event.key.lastIndexOf("/") + 1);
 		const pick = pickerEvent(event);
 		if (pick) {

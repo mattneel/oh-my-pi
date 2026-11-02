@@ -245,6 +245,22 @@ remain component-owned; `interrupt`, tool approval
 `allow`/`always`/`deny`, and `questions` `submit` are host-intercepted ACP
 controls, not alternate completion paths.
 
+Viewer screen commands use `{ev:"command",name,args,viewer,sf?,id?}` without a
+node ID. `NativeHost.handleCommand(NativeCommandEvent)` returns the viewer-owned
+surface ID after a component mounts, or rejects with a named refusal. The
+backend checks the `viewers` gate, input surface audience and returned audience,
+then sends asynchronous `{r:"command",name,viewer,id?,ok,sf?,error?}`. Pending
+replies are invalidated when the backend stops. Empty/omitted input `sf` resolves
+to the active shared document. ACP advertises only real openers through
+`_meta["omp/screen"]`; typed ACP slash prompts use their original dispatcher.
+
+The full Models screen is `ModelHubComponent` (`omp.overlay.model-hub`), not the
+dock's compact picker. Both hosts use shared model-role mutation callbacks.
+Settings, agent configuration, OAuth and report screens similarly reuse native
+components through narrow capability/lifetime hosts. A viewer readiness promise
+distinguishes a mounted component from a viewer closed during asynchronous setup;
+late results and stale role assignments may not revive or mutate that viewer.
+
 `ChatTranscriptBuilderDeps.nativeIdentity` opts into durable wire `p.key` and
 explicit persisted Yard display metadata. Assistant messages receive a reserved
 `sessionEntryId` before live events; persistence uses that same entry ID, and

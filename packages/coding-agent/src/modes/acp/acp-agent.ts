@@ -100,6 +100,7 @@ import type { AcpPresentation } from "./acp-presentation";
 import { getAcpInteractionProjection, type AcpInteractionProjection } from "./acp-interactions";
 import { bindAcpPresentationRuntime } from "./acp-cockpit";
 import type { EventBusLike } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+import { ACP_SCREEN_COMMAND_NAMES } from "./acp-screen-commands";
 
 import { cfgDisabledExtensions } from "../../extensibility/settings";
 import { cfgPlanEnabled } from "../../plan-mode/settings";
@@ -2809,7 +2810,11 @@ export class AcpAgent implements Agent {
 	}
 
 	async #buildAvailableCommands(session: AgentSession): Promise<AvailableCommand[]> {
-		return toAcpAvailableCommands(await buildAvailableSlashCommands(session));
+		return toAcpAvailableCommands(
+			await buildAvailableSlashCommands(session, undefined, {
+				screenCommands: this.#presentation?.supportsViewerCommands ? ACP_SCREEN_COMMAND_NAMES : undefined,
+			}),
+		);
 	}
 
 	#toSessionInfo(session: StoredSessionInfo): SessionInfo {
@@ -3576,14 +3581,17 @@ export class AcpAgent implements Agent {
 			}
 			record.mcpManager = undefined;
 		}
-		try {
-			await record.session.dispose({ reason });
-		} catch (error) {
-			logger.warn("Failed to dispose ACP session", { error });
-		}
+		await this.#disposeStandaloneSession(record.session, reason);
 	}
 
 	async #disposeStandaloneSession(session: AgentSession, reason?: postmortem.Reason): Promise<void> {
+		try {
+			// Viewer settings and role edits use the same deferred persistence as Tern.
+			// A headless process must not exit before its session clone flushes those writes.
+			await session.settings.flush();
+		} catch (error) {
+			logger.warn("Failed to persist ACP session settings", { error });
+		}
 		try {
 			await session.dispose({ reason });
 		} catch (error) {

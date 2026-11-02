@@ -22,6 +22,7 @@ export class AcpViewerHost implements NativeHost, AgentHubHost {
 	#closed = false;
 	#notice: string | undefined;
 	readonly #lifetime = new AbortController();
+	readonly #mounted = Promise.withResolvers<boolean>();
 
 	constructor(
 		readonly terminal: TspTransport,
@@ -41,9 +42,15 @@ export class AcpViewerHost implements NativeHost, AgentHubHost {
 		return this.#lifetime.signal;
 	}
 
+	/** Whether a real component mounted, or the viewer closed before any UI was ready. */
+	get ready(): Promise<boolean> {
+		return this.#mounted.promise;
+	}
+
 	mount(component: Component): void {
 		this.#root = component;
 		this.#focus = component;
+		this.#mounted.resolve(true);
 		this.requestRender();
 	}
 
@@ -79,6 +86,7 @@ export class AcpViewerHost implements NativeHost, AgentHubHost {
 	showOverlay(component: Component, _options?: OverlayOptions): OverlayHandle {
 		const entry: ViewerOverlay = { component, hidden: false };
 		this.#overlays.push(entry);
+		this.#mounted.resolve(true);
 		this.requestRender();
 		return {
 			hide: () => {
@@ -120,6 +128,7 @@ export class AcpViewerHost implements NativeHost, AgentHubHost {
 	dispose(): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#mounted.resolve(false);
 		this.#lifetime.abort();
 		// The hub owns its nested transcript's timers and disposal.
 		this.#root?.dispose?.();
