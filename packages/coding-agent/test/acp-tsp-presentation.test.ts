@@ -11,8 +11,10 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import { AcpPresentation } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-presentation";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -31,6 +33,7 @@ import { getCurrentThemeName, initTheme } from "@oh-my-pi/pi-tui/theme";
 import { TSP_KINDS, type TspEvent, type TspNode } from "@oh-my-pi/pi-wire";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { AgentSideConnection, type AnyMessage, ClientSideConnection } from "@oh-my-pi/pi-utils/acp";
+import type { Client, CreateElicitationResponse, RequestPermissionResponse } from "@oh-my-pi/pi-utils/acp";
 import { ManualScheduler, TspTestTerminal, tspEvent } from "../../tui/test/native/tsp-harness";
 import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -63,7 +66,8 @@ class PresentationChannel implements TspTransport {
 	closeCalls = 0;
 	inputCalls = 0;
 
-	constructor() {
+	constructor(features: readonly string[] = ["settle", "dock"]) {
+		this.helloReply = { ...this.helloReply, features };
 		this.terminal.start(sequence => {
 			this.inputCalls++;
 			for (const listener of this.#input) listener(sequence);
@@ -352,6 +356,7 @@ async function createPresentationFixture(
 	extensionFactory?: ExtensionFactory,
 	collapseCompactedHistory = false,
 	sideStreamFn?: StreamFn,
+	cockpit = false,
 ): Promise<PresentationFixture> {
 	const authStorage = createInMemoryAuthStorage();
 	const mock = createMockModel({ responses: [] });
@@ -397,8 +402,9 @@ async function createPresentationFixture(
 		modelRegistry: registry,
 		extensionRunner,
 		sideStreamFn,
+		toolRegistry: new Map((options.initialState?.tools ?? []).map(tool => [tool.name, tool])),
 	});
-	const channel = new PresentationChannel();
+	const channel = new PresentationChannel(cockpit ? ["settle", "dock", "viewers", "keys"] : undefined);
 	const presentation = new AcpPresentation(channel, channel.helloReply);
 	return {
 		session,
@@ -415,14 +421,24 @@ async function createPresentationFixture(
 }
 
 /** Shared real ACP loopback for compact, handoff and shake history consumers. */
-function createPresentationControl(fixture: Pick<PresentationFixture, "session" | "presentation">) {
+function createPresentationControl(
+	fixture: Pick<PresentationFixture, "session" | "presentation">,
+	handlers: Partial<Client> = {},
+	setToolUIContext: (ui: ExtensionUIContext, hasUI: boolean) => void = () => {},
+) {
 	const toAgent = new TransformStream<AnyMessage>();
-	const toClient = new TransformStream<AnyMessage>();
+	const messages: AnyMessage[] = [];
+	const toClient = new TransformStream<AnyMessage, AnyMessage>({
+		transform(message, controller) {
+			messages.push(message);
+			controller.enqueue(message);
+		},
+	});
 	const agentConnection = new AgentSideConnection(
 		connection =>
 			new AcpAgent(
 				connection,
-				async () => ({ session: fixture.session, setToolUIContext: () => {} }),
+				async () => ({ session: fixture.session, setToolUIContext }),
 				fixture.session,
 				fixture.presentation,
 			),
@@ -432,10 +448,12 @@ function createPresentationControl(fixture: Pick<PresentationFixture, "session" 
 		() => ({
 			sessionUpdate: () => {},
 			requestPermission: () => ({ outcome: { outcome: "cancelled" } }),
+			...handlers,
 		}),
 		{ readable: toClient.readable, writable: toAgent.writable },
 	);
 	return {
+		messages,
 		client,
 		async close() {
 			await Promise.all([toAgent.writable.close(), toClient.writable.close()]);
@@ -1262,5 +1280,550 @@ it("does not let a queued retry refresh steal a newly selected live session", as
 		await livePrompt?.catch(() => {});
 		await fixture.dispose();
 		await selected.dispose();
+	}
+});
+
+it.each([
+	["allow_once", "once", 1],
+	["allow_always", "session", 1],
+	["reject_once", "denied", 0],
+	["reject_always", "denied", 0],
+] as const)(
+	"projects a held ACP permission as a confirm card and settles %s only over ACP",
+	async (optionId, approved, expectedExecutions) => {
+		using tempDir = TempDir.createSync("@pi-acp-cockpit-permission-");
+		let executions = 0;
+		const tool: AgentTool = {
+			name: "bash",
+			label: "Bash",
+			description: "Permission-gated fixture",
+			parameters: type({ command: "string" }),
+			async execute() {
+				executions++;
+				return { content: [{ type: "text", text: "Executed once." }] };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "approval-tool-1",
+							name: tool.name,
+							arguments: { command: "echo permission" },
+						},
+					],
+				},
+				{ content: ["Permission turn finished."] },
+			],
+		});
+		const fixture = await createPresentationFixture(
+			SessionManager.inMemory(tempDir.path()),
+			{ streamFn: mock.stream, initialState: { tools: [tool] } },
+			undefined,
+			false,
+			undefined,
+			true,
+		);
+		const requested = Promise.withResolvers<void>();
+		const answer = Promise.withResolvers<RequestPermissionResponse>();
+		const control = createPresentationControl(fixture, {
+			requestPermission: () => {
+				requested.resolve();
+				return answer.promise;
+			},
+		});
+		let prompt: Promise<unknown> | undefined;
+		try {
+			await control.client.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			const created = await control.client.newSession({ cwd: tempDir.path(), mcpServers: [] });
+			const shared = fixture.channel.terminal.surface!;
+			prompt = control.client.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "Run the gated command." }],
+			});
+			void prompt.catch(() => {});
+			await requested.promise;
+			await fixture.channel.until(() =>
+				fixture.channel.nodes(shared).some(node => node.k === "tool" && node.p?.status === "ask"),
+			);
+			const card = fixture.channel
+				.nodes(shared)
+				.find(node => node.k === "tool" && node.p?.key === "approval-tool-1")!;
+			expect(card.p).toMatchObject({
+				status: "ask",
+				confirm: "card",
+				ask: { allow: "Allow once", always: "Always allow", deny: "Reject" },
+			});
+			fixture.channel.event({ ev: "action", sf: shared, id: card.id, act: "allow", mods: [] });
+			expect(executions).toBe(0);
+			expect(fixture.channel.nodes(shared).find(node => node.id === card.id)?.p).toHaveProperty("status", "ask");
+			answer.resolve({ outcome: { outcome: "selected", optionId } });
+			await prompt;
+			await fixture.channel.until(() =>
+				fixture.channel
+					.nodes(shared)
+					.some(node => node.id === card.id && node.p && "approved" in node.p && node.p.approved === approved),
+			);
+			const settled = fixture.channel.nodes(shared).find(node => node.id === card.id)!;
+			expect(settled.p).toMatchObject({ approved });
+			expect(settled.p).not.toHaveProperty("confirm");
+			expect(settled.p).not.toHaveProperty("ask");
+			expect(executions).toBe(expectedExecutions);
+			fixture.presentation.refreshSession(fixture.session);
+			await fixture.channel.until(() =>
+				fixture.channel
+					.nodes(shared)
+					.some(node => node.k === "tool" && node.p?.key === "approval-tool-1" && node.p.approved === approved),
+			);
+			expect(fixture.channel.terminal.errors).toEqual([]);
+		} finally {
+			answer.resolve({ outcome: { outcome: "cancelled" } });
+			await prompt?.catch(() => {});
+			await fixture.dispose();
+			await control.close();
+		}
+	},
+);
+
+it.each(["approve", "cancel"] as const)(
+	"retains a permission before its real tool card and clears confirm on %s",
+	async settlement => {
+		using tempDir = TempDir.createSync("@pi-acp-cockpit-precard-");
+		const fixture = await createPresentationFixture(
+			SessionManager.inMemory(tempDir.path()),
+			{},
+			undefined,
+			false,
+			undefined,
+			true,
+		);
+		const answer = Promise.withResolvers<RequestPermissionResponse>();
+		const cancellation = new AbortController();
+		const requested = Promise.withResolvers<void>();
+		const control = createPresentationControl(fixture, {
+			requestPermission: () => {
+				requested.resolve();
+				return answer.promise;
+			},
+		});
+		let permission: Promise<unknown> | undefined;
+		try {
+			await control.client.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			await control.client.newSession({ cwd: tempDir.path(), mcpServers: [] });
+			permission = fixture.session.clientBridge!.requestPermission!(
+				{ toolCallId: "permission-before-card", toolName: "lookup", title: "Late card" },
+				[{ optionId: "once", name: "Allow", kind: "allow_once" }],
+				cancellation.signal,
+			);
+			void permission.catch(() => {});
+			await requested.promise;
+			expect(fixture.channel.nodes().some(node => node.k === "tool")).toBe(false);
+			fixture.session.agent.emitExternalEvent({
+				type: "tool_execution_start",
+				toolCallId: "permission-before-card",
+				toolName: "lookup",
+				args: {},
+			});
+			await fixture.channel.until(() =>
+				fixture.channel
+					.nodes()
+					.some(node => node.k === "tool" && node.p?.key === "permission-before-card" && node.p.status === "ask"),
+			);
+			if (settlement === "cancel") cancellation.abort();
+			else answer.resolve({ outcome: { outcome: "selected", optionId: "once" } });
+			await permission;
+			await fixture.channel.until(() =>
+				fixture.channel
+					.nodes()
+					.some(node => node.k === "tool" && node.p?.key === "permission-before-card" && node.p.status !== "ask"),
+			);
+			const settled = fixture.channel
+				.nodes()
+				.find(node => node.k === "tool" && node.p?.key === "permission-before-card")!;
+			expect(settled.p).not.toHaveProperty("confirm");
+			expect(settled.p).not.toHaveProperty("ask");
+			if (settlement === "approve") expect(settled.p).toHaveProperty("approved", "once");
+			else expect(settled.p).not.toHaveProperty("approved");
+			expect(fixture.channel.terminal.errors).toEqual([]);
+		} finally {
+			answer.resolve({ outcome: { outcome: "cancelled" } });
+			await permission?.catch(() => {});
+			await fixture.dispose();
+			await control.close();
+		}
+	},
+);
+
+it.each(["answer", "form", "cancel"] as const)(
+	"projects real elicitation ids, adjacency, multi/recommended/free text and %s settlement",
+	async settlement => {
+		using tempDir = TempDir.createSync("@pi-acp-cockpit-question-");
+		let ui: ExtensionUIContext | undefined;
+		let submitted: unknown;
+		const tool: AgentTool = {
+			name: "ask_fixture",
+			label: "Ask",
+			description: "Ask via the ACP extension UI",
+			parameters: type({}),
+			async execute(toolCallId, _args, signal) {
+				if (!ui?.askDialog) throw new Error("ACP did not install the elicitation UI");
+				submitted = await ui.askDialog(
+					[
+						{
+							id: "choice",
+							question: "Choose a direction",
+							header: "Direction",
+							options: [{ label: "North", description: "The northern route" }, { label: "South" }],
+							recommended: 0,
+						},
+						{
+							id: "features",
+							question: "Choose features",
+							options: [{ label: "Fast" }, { label: "Safe" }],
+							multi: true,
+							recommended: 1,
+						},
+						{ id: "comment", question: "Explain", options: [] },
+					],
+					{ signal, toolCallId },
+				);
+				return { content: [{ type: "text", text: "Question completed." }] };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "asking-tool-1", name: tool.name, arguments: {} }] },
+				{ content: ["Question turn finished."] },
+			],
+		});
+		const fixture = await createPresentationFixture(
+			SessionManager.inMemory(tempDir.path()),
+			{ streamFn: mock.stream, initialState: { tools: [tool] } },
+			undefined,
+			false,
+			undefined,
+			true,
+		);
+		const requested = Promise.withResolvers<void>();
+		const answer = Promise.withResolvers<CreateElicitationResponse>();
+		const control = createPresentationControl(
+			fixture,
+			{
+				unstable_createElicitation: () => {
+					requested.resolve();
+					return answer.promise;
+				},
+			},
+			context => {
+				ui = context;
+			},
+		);
+		let prompt: Promise<unknown> | undefined;
+		try {
+			await control.client.initialize({ protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } });
+			const created = await control.client.newSession({ cwd: tempDir.path(), mcpServers: [] });
+			const shared = fixture.channel.terminal.surface!;
+			prompt = control.client.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "Ask the questions." }],
+			});
+			void prompt.catch(() => {});
+			await requested.promise;
+			const wire = control.messages.find(message => "method" in message && message.method === "elicitation/create");
+			if (!wire || !("id" in wire)) throw new Error("No actual elicitation request was sent");
+			expect(wire).toMatchObject({ params: { _meta: { "omp/toolCallId": "asking-tool-1" } } });
+			await fixture.channel.until(() => fixture.channel.nodes(shared).some(node => node.k === "questions"));
+			const question = fixture.channel.nodes(shared).find(node => node.k === "questions")!;
+			expect(question.p).toMatchObject({
+				key: `question:${wire.id}`,
+				items: [
+					{
+						id: "q0",
+						prompt: "Choose a direction",
+						description: "Direction",
+						choices: [{ value: "North", detail: "The northern route · Recommended" }, { value: "South" }],
+						other: true,
+					},
+					{ id: "q1", prompt: "Choose features", multi: true, other: true },
+					{ id: "q2", prompt: "Explain", other: true },
+				],
+				answers: { q0: "North", q1: ["Safe"] },
+			});
+			const order = fixture.channel.nodes(shared);
+			expect(order.findIndex(node => node.p?.key === "asking-tool-1")).toBeLessThan(
+				order.findIndex(node => node.id === question.id),
+			);
+			fixture.channel.event({
+				ev: "action",
+				sf: shared,
+				id: question.id,
+				act: "submit",
+				value: { q0: "South", q1: ["Fast", "custom feature"], q2: "Free text" },
+				mods: [],
+			});
+			expect(submitted).toBeUndefined();
+			if (settlement === "cancel") {
+				await control.client.cancel({ sessionId: created.sessionId });
+			} else {
+				answer.resolve({
+					action: "accept",
+					content:
+						settlement === "form"
+							? { q0: "South", q1: ["Fast"], q1__other: "custom feature", q2__other: "Free text" }
+							: { q0: "South", q1: ["Fast", "custom feature"], q2: "Free text" },
+				});
+			}
+			await prompt;
+			await fixture.channel.until(() =>
+				fixture.channel
+					.nodes(shared)
+					.some(node => node.id === question.id && node.k === "questions" && node.p?.readonly === true),
+			);
+			const resolved = fixture.channel.nodes(shared).find(node => node.id === question.id)!;
+			expect(resolved.p).toMatchObject({ readonly: true, hint: settlement !== "cancel" ? "Answered" : "Cancelled" });
+			if (settlement !== "cancel") {
+				expect(resolved.p).toMatchObject({
+					answers: { q0: "South", q1: ["Fast", "custom feature"], q2: "Free text" },
+				});
+				expect(submitted).toMatchObject({
+					kind: "submit",
+					results: [
+						{ id: "choice", selectedOptions: ["South"] },
+						{ id: "features", selectedOptions: ["Fast"], customInput: "custom feature" },
+						{ id: "comment", selectedOptions: [], customInput: "Free text" },
+					],
+				});
+			}
+			fixture.presentation.refreshSession(fixture.session);
+			await fixture.channel.until(() =>
+				fixture.channel
+					.nodes(shared)
+					.some(
+						node => node.k === "questions" && node.p?.key === `question:${wire.id}` && node.p.readonly === true,
+					),
+			);
+			expect(fixture.channel.terminal.errors).toEqual([]);
+		} finally {
+			answer.resolve({ action: "cancel" });
+			await prompt?.catch(() => {});
+			await fixture.dispose();
+			await control.close();
+		}
+	},
+);
+
+it.each([false, true])(
+	"keeps Yard display metadata and stable keys behind viewers=%s through refresh and reload",
+	async cockpit => {
+		using tempDir = TempDir.createSync("@pi-acp-cockpit-identities-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+		const mock = createMockModel({ responses: [{ content: ["Stable assistant answer."] }] });
+		const fixture = await createPresentationFixture(
+			manager,
+			{ streamFn: mock.stream },
+			undefined,
+			false,
+			undefined,
+			cockpit,
+		);
+		const control = createPresentationControl(fixture);
+		let restored: PresentationFixture | undefined;
+		try {
+			await control.client.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			const created = await control.client.newSession({ cwd: tempDir.path(), mcpServers: [] });
+			await control.client.prompt({
+				sessionId: created.sessionId,
+				_meta: { "clankyard/turn": "yard-turn-stable" },
+				prompt: [
+					{ type: "text", text: "Private Yard context", _meta: { "clankyard/role": "context" } },
+					{ type: "text", text: "Visible operator message" },
+				],
+			});
+			await fixture.channel.until(() => texts(fixture.channel.nodes()).includes("Stable assistant answer."));
+			const user = fixture.channel.nodes().find(node => node.p?.role === "omp.user")!;
+			if (cockpit) {
+				expect(user.p?.key).toBe("yard-turn-stable");
+				expect(user.c?.find(node => node.k === "md")?.p).toHaveProperty("text", "Visible operator message");
+				expect(fixture.channel.nodes().find(node => node.p?.role === "clankyard.context")?.p).toMatchObject({
+					head: "Yard context",
+					collapsed: true,
+				});
+				expect(fixture.channel.nodes().some(node => node.p?.role === "omp.dock")).toBe(true);
+			} else {
+				expect(user.p?.key).toBeUndefined();
+				expect(texts(fixture.channel.nodes())).toContain("Private Yard context\n\nVisible operator message");
+				expect(
+					fixture.channel
+						.nodes()
+						.some(node => node.p?.role === "clankyard.context" || node.p?.role === "omp.dock"),
+				).toBe(false);
+			}
+			const keys = fixture.channel
+				.nodes()
+				.filter(node => node.p?.role === "omp.user" || node.p?.role === "omp.assistant")
+				.map(node => node.p?.key);
+			const assistantEntry = manager
+				.getBranch()
+				.find(entry => entry.type === "message" && entry.message.role === "assistant");
+			expect(control.messages).toContainEqual(
+				expect.objectContaining({
+					method: "session/update",
+					params: expect.objectContaining({
+						update: expect.objectContaining({
+							sessionUpdate: "agent_message_chunk",
+							messageId: assistantEntry?.id,
+						}),
+					}),
+				}),
+			);
+			if (cockpit) expect(keys).toContain(`${assistantEntry?.id}:before`);
+			const storedUser = fixture.session.messages.find(message => message.role === "user");
+			expect(storedUser?.content).toEqual(
+				expect.arrayContaining([{ type: "text", text: "Private Yard context\n\nVisible operator message" }]),
+			);
+			await manager.flush();
+			const beforeReplay = control.messages.length;
+			await control.client.loadSession({ sessionId: created.sessionId, cwd: tempDir.path(), mcpServers: [] });
+			expect(control.messages.slice(beforeReplay)).toContainEqual(
+				expect.objectContaining({
+					method: "session/update",
+					params: expect.objectContaining({
+						update: expect.objectContaining({
+							sessionUpdate: "user_message_chunk",
+							messageId: "yard-turn-stable",
+						}),
+					}),
+				}),
+			);
+			expect(control.messages.slice(beforeReplay)).toContainEqual(
+				expect.objectContaining({
+					method: "session/update",
+					params: expect.objectContaining({
+						update: expect.objectContaining({
+							sessionUpdate: "agent_message_chunk",
+							messageId: assistantEntry?.id,
+						}),
+					}),
+				}),
+			);
+			fixture.presentation.refreshSession(fixture.session);
+			await fixture.channel.until(() => texts(fixture.channel.nodes()).includes("Stable assistant answer."));
+			expect(
+				fixture.channel
+					.nodes()
+					.filter(node => node.p?.role === "omp.user" || node.p?.role === "omp.assistant")
+					.map(node => node.p?.key),
+			).toEqual(keys);
+			restored = await createPresentationFixture(
+				await SessionManager.open(manager.getSessionFile()!),
+				{},
+				undefined,
+				false,
+				undefined,
+				cockpit,
+			);
+			restored.presentation.showSession(restored.session);
+			await restored.channel.until(() => texts(restored!.channel.nodes()).includes("Stable assistant answer."));
+			expect(
+				restored.channel
+					.nodes()
+					.filter(node => node.p?.role === "omp.user" || node.p?.role === "omp.assistant")
+					.map(node => node.p?.key),
+			).toEqual(keys);
+			expect(fixture.channel.terminal.errors).toEqual([]);
+			expect(restored.channel.terminal.errors).toEqual([]);
+		} finally {
+			await restored?.dispose();
+			await fixture.dispose();
+			await control.close();
+		}
+	},
+);
+
+it("opens an advisor transcript in only its viewer and refuses advisor lifecycle mutations", async () => {
+	using tempDir = TempDir.createSync("@pi-acp-cockpit-hub-");
+	const manager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+	manager.appendMessage({ role: "user", content: "Shared parent conversation.", timestamp: 1 });
+	const fixture = await createPresentationFixture(manager, {}, undefined, false, undefined, true);
+	const rootFile = manager.getSessionFile()!;
+	const child = SessionManager.create(tempDir.path(), `${rootFile.slice(0, -".jsonl".length)}/advisor`);
+	child.appendMessage({ role: "user", content: "Review only.", timestamp: 1 });
+	child.appendMessage(createAssistantMessage("Private advisor transcript."));
+	await child.flush();
+	const registry = AgentRegistry.global();
+	const advisorId = `cockpit-advisor-${crypto.randomUUID()}`;
+	const ref = registry.register({
+		id: advisorId,
+		displayName: "Cockpit advisor",
+		kind: "advisor",
+		session: null,
+		sessionFile: child.getSessionFile(),
+		status: "parked",
+	});
+	try {
+		fixture.presentation.showSession(fixture.session);
+		const shared = fixture.channel.terminal.surface!;
+		await fixture.channel.until(() => fixture.channel.nodes(shared).some(node => node.p?.role === "omp.agents"));
+		const agents = fixture.channel.nodes(shared).find(node => node.p?.role === "omp.agents")!;
+		for (const viewer of ["hub-a", "hub-b"])
+			fixture.channel.event({ ev: "action", sf: shared, id: agents.id, act: "agents", viewer, mods: [] });
+		const viewerSurface = (viewer: string): string | undefined => {
+			const open = fixture.channel.terminal.log.find(
+				message =>
+					message.verb === "o" &&
+					typeof message.body === "object" &&
+					message.body !== null &&
+					"viewer" in message.body &&
+					message.body.viewer === viewer,
+			);
+			return open &&
+				typeof open.body === "object" &&
+				open.body !== null &&
+				"id" in open.body &&
+				typeof open.body.id === "string"
+				? open.body.id
+				: undefined;
+		};
+		await fixture.channel.until(() => Boolean(viewerSurface("hub-a") && viewerSurface("hub-b")));
+		const a = viewerSurface("hub-a")!;
+		const b = viewerSurface("hub-b")!;
+		await fixture.channel.until(
+			() =>
+				fixture.channel.nodes(a).some(node => node.k === "picker") &&
+				fixture.channel.nodes(b).some(node => node.k === "picker"),
+		);
+		const pickerA = fixture.channel.nodes(a).find(node => node.k === "picker")!;
+		const pickerB = fixture.channel.nodes(b).find(node => node.k === "picker")!;
+		fixture.channel.event({ ev: "activate", sf: a, id: pickerA.id, item: advisorId, viewer: "hub-a" });
+		await fixture.channel.until(() => texts(fixture.channel.nodes(a)).includes("Private advisor transcript."));
+		expect(texts(fixture.channel.nodes(shared))).not.toContain("Private advisor transcript.");
+		expect(texts(fixture.channel.nodes(b))).not.toContain("Private advisor transcript.");
+		expect(fixture.channel.nodes(a).some(node => node.k === "editor" && node.p?.sendable)).toBe(false);
+		fixture.channel.event({ ev: "select", sf: b, id: pickerB.id, item: advisorId, viewer: "hub-b" });
+		for (const act of ["revive", "kill"]) {
+			fixture.channel.event({ ev: "action", sf: b, id: pickerB.id, act, viewer: "hub-b", mods: [] });
+			await fixture.channel.until(() => JSON.stringify(fixture.channel.nodes(b)).includes("read-only advisor"));
+			expect(registry.get(advisorId)).toBe(ref);
+			expect(ref.status).toBe("parked");
+			expect(ref.session).toBeNull();
+		}
+		fixture.channel.event({ ev: "viewer", viewer: "hub-a", present: false });
+		await fixture.channel.until(() =>
+			fixture.channel.terminal.log.some(
+				message =>
+					message.verb === "x" &&
+					typeof message.body === "object" &&
+					message.body !== null &&
+					"id" in message.body &&
+					message.body.id === a,
+			),
+		);
+		expect(fixture.channel.nodes(b).some(node => node.id === pickerB.id)).toBe(true);
+		expect(fixture.channel.terminal.errors).toEqual([]);
+	} finally {
+		registry.unregister(advisorId);
+		await fixture.dispose();
 	}
 });

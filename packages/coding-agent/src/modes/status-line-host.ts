@@ -1,5 +1,5 @@
 import type { StatusLineHost, StatusLineSession } from "@oh-my-pi/pi-tui/status-line/host";
-import { Settings, settings } from "../config/settings";
+import { Settings, settings as globalSettings } from "../config/settings";
 import type { AgentSession } from "../session/agent-session";
 import { getSessionCompactionBoundaries } from "../session/context-usage-runtime";
 import { claimResetExpiryNotice, classifyResetExpiry } from "../session/reset-expiry";
@@ -33,44 +33,51 @@ export type StatusLineHostSession = StatusLineSession &
 	Partial<Pick<AgentSession, "settings" | "modelRegistry" | "sessionId" | "fetchUsageReports">>;
 
 /** Application policy and runtime services consumed by the portable status renderer. */
+export function createStatusLineHost(settings: Settings): StatusLineHost<StatusLineHostSession> {
+	return {
+		getSettings: () => ({
+			preset: cfgStatusLinePreset.get(settings),
+			leftSegments: cfgStatusLineLeftSegments.get(settings),
+			rightSegments: cfgStatusLineRightSegments.get(settings),
+			separator: cfgStatusLineSeparator.get(settings),
+			showHookStatus: cfgStatusLineShowHookStatus.get(settings),
+			segmentOptions: cfgStatusLineSegmentOptions.get(settings),
+			sessionAccent: cfgStatusLineSessionAccent.get(settings),
+			transparent: cfgStatusLineTransparent.get(settings),
+			compactThinkingLevel: cfgStatusLineCompactThinkingLevel.get(settings),
+			contextLine: cfgStatusLineContextLine.get(settings),
+		}),
+		gitEnabled: () => cfgGitEnabled.get(settings),
+		codexResetFireworksEnabled: () => cfgTuiCodexResetFireworks.get(settings),
+		getSettingsRevision: () => settings.revision,
+		getSessionSettingsIdentity: session => session.settings,
+		getSessionSettingsRevision: session => session.settings?.revision ?? 0,
+		goalStatusInFooter: session => cfgGoalStatusInFooter.get(session.settings ?? settings),
+		activeAccount: (session, provider) =>
+			session.modelRegistry?.authStorage?.oauth.identity(provider, session.sessionId),
+		canFetchUsageReports: session => typeof session.fetchUsageReports === "function",
+		fetchUsageReports: (session, signal) => session.fetchUsageReports?.(signal) ?? Promise.resolve(null),
+		resolveActiveRepo: resolveActiveRepoContextSync,
+		lookupPullRequest: cwd =>
+			github.run(cwd, ["pr", "view", "--json", "number,url"], AbortSignal.timeout(GH_COMMAND_TIMEOUT_MS)),
+		calculateTokensPerSecond,
+		limitMatchesActiveAccount,
+		classifyResetExpiry,
+		resetExpiryNotice: (session, reports, nowMs) => {
+			// agent.db records which resets were warned about across omp processes; without it, stay quiet
+			// rather than repeat the warning on every refresh.
+			const storage = (session.settings ?? settings).getStorage();
+			return storage
+				? claimResetExpiryNotice(reports, nowMs, (key, expiresAtMs) => storage.claimNotice(key, expiresAtMs))
+				: undefined;
+		},
+		computeCompactionBoundaries: (session, contextWindow, model) =>
+			getSessionCompactionBoundaries(session.settings ?? settings, contextWindow, model),
+	};
+}
+
+/** Interactive mode follows the process-wide settings instance across reloads. */
 export const statusLineHost: StatusLineHost<StatusLineHostSession> = {
-	getSettings: () => ({
-		preset: cfgStatusLinePreset.get(settings),
-		leftSegments: cfgStatusLineLeftSegments.get(settings),
-		rightSegments: cfgStatusLineRightSegments.get(settings),
-		separator: cfgStatusLineSeparator.get(settings),
-		showHookStatus: cfgStatusLineShowHookStatus.get(settings),
-		segmentOptions: cfgStatusLineSegmentOptions.get(settings),
-		sessionAccent: cfgStatusLineSessionAccent.get(settings),
-		transparent: cfgStatusLineTransparent.get(settings),
-		compactThinkingLevel: cfgStatusLineCompactThinkingLevel.get(settings),
-		contextLine: cfgStatusLineContextLine.get(settings),
-	}),
-	gitEnabled: () => cfgGitEnabled.get(settings),
-	codexResetFireworksEnabled: () => cfgTuiCodexResetFireworks.get(settings),
-	// Read per frame: skip the `settings` proxy trap and hit the instance getter directly.
+	...createStatusLineHost(globalSettings),
 	getSettingsRevision: () => Settings.instance.revision,
-	getSessionSettingsIdentity: session => session.settings,
-	getSessionSettingsRevision: session => session.settings?.revision ?? 0,
-	goalStatusInFooter: session => cfgGoalStatusInFooter.get(session.settings ?? settings),
-	activeAccount: (session, provider) =>
-		session.modelRegistry?.authStorage?.oauth.identity(provider, session.sessionId),
-	canFetchUsageReports: session => typeof session.fetchUsageReports === "function",
-	fetchUsageReports: (session, signal) => session.fetchUsageReports?.(signal) ?? Promise.resolve(null),
-	resolveActiveRepo: resolveActiveRepoContextSync,
-	lookupPullRequest: cwd =>
-		github.run(cwd, ["pr", "view", "--json", "number,url"], AbortSignal.timeout(GH_COMMAND_TIMEOUT_MS)),
-	calculateTokensPerSecond,
-	limitMatchesActiveAccount,
-	classifyResetExpiry,
-	resetExpiryNotice: (session, reports, nowMs) => {
-		// agent.db records which resets were warned about across omp processes; without it, stay quiet
-		// rather than repeat the warning on every refresh.
-		const storage = (session.settings ?? settings).getStorage();
-		return storage
-			? claimResetExpiryNotice(reports, nowMs, (key, expiresAtMs) => storage.claimNotice(key, expiresAtMs))
-			: undefined;
-	},
-	computeCompactionBoundaries: (session, contextWindow, model) =>
-		getSessionCompactionBoundaries(session.settings ?? settings, contextWindow, model),
 };

@@ -7,6 +7,9 @@
 ### Added
 
 - Added the collab envelope helpers `packEnvelope`, `unpackEnvelope` and `rewriteEnvelopePeer`
+### Added
+
+- Added opt-in `viewers` and `keys` negotiation, viewer audiences and input events, object-valued actions, tool approval props and the `questions` kind for multiplayer ACP cockpits.
 
 ## [18.14.2] - 2026-10-31
 

@@ -590,8 +590,8 @@ async function createHarness(
 			options.permissionHandler?.(request);
 			return { promise: Promise.resolve({ outcome: { outcome: "cancelled" } }), cancel: () => {} };
 		},
-		unstable_createElicitation: options.elicitationHandler
-			? async (req: CreateElicitationRequest) => options.elicitationHandler!(req)
+		unstable_createElicitationWithCancel: options.elicitationHandler
+			? (req: CreateElicitationRequest) => ({ id: 0, promise: options.elicitationHandler!(req), cancel: () => {} })
 			: undefined,
 		signal: abortController.signal,
 		closed: Promise.withResolvers<void>().promise,
@@ -3614,9 +3614,9 @@ describe("ACP agent", () => {
 		} {
 			const calls: CreateElicitationRequest[] = [];
 			const connection = {
-				unstable_createElicitation: async (req: CreateElicitationRequest) => {
+				unstable_createElicitationWithCancel: (req: CreateElicitationRequest) => {
 					calls.push(req);
-					return handler(req);
+					return { id: calls.length - 1, promise: handler(req), cancel: () => {} };
 				},
 			} as unknown as AgentSideConnection;
 			return { connection, calls };
@@ -3748,7 +3748,7 @@ describe("ACP agent", () => {
 			});
 		});
 
-		it("uses only free-text fields for questions without options", async () => {
+		it("keeps a primary free-text field and companion for questions without options", async () => {
 			const { connection, calls } = createElicitConnection(async () => ({
 				action: "accept",
 				content: { q0__other: "single answer", q1__other: "multi answer" },
@@ -3763,14 +3763,14 @@ describe("ACP agent", () => {
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
-			expect(Object.keys(request.requestedSchema.properties)).toEqual(["q0__other", "q1__other"]);
+			expect(Object.keys(request.requestedSchema.properties)).toEqual(["q0", "q0__other", "q1", "q1__other"]);
 			expect(result?.kind === "submit" ? result.results : undefined).toMatchObject([
 				{ id: "single", selectedOptions: [], customInput: "single answer" },
 				{ id: "multi", selectedOptions: [], customInput: "multi answer" },
 			]);
 		});
 
-		it("drops ask values the client was never offered", async () => {
+		it("treats Tern answers outside the offered choices as custom free text", async () => {
 			const { connection } = createElicitConnection(async () => ({
 				action: "accept",
 				content: { q0: "Nonexistent" },
@@ -3779,7 +3779,10 @@ describe("ACP agent", () => {
 
 			const result = await ctx.askDialog!([{ id: "choice", question: "Choose", options: [{ label: "Existing" }] }]);
 
-			expect(result?.kind === "submit" ? result.results[0]?.selectedOptions : undefined).toEqual([]);
+			expect(result?.kind === "submit" ? result.results[0] : undefined).toMatchObject({
+				selectedOptions: [],
+				customInput: "Nonexistent",
+			});
 		});
 
 		it("packs multiple ask questions into one ordered form", async () => {

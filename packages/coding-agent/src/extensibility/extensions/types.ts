@@ -206,6 +206,8 @@ export function timedOutAskDialogResult(questions: ExtensionAskDialogQuestion[])
  */
 export interface ExtensionUIDialogOptions {
 	signal?: AbortSignal;
+	/** Asking tool identity, used by ACP presentation to place the form after its tool card. */
+	toolCallId?: string;
 	timeout?: number;
 	/** Invoked when the UI times out while waiting for a selection/input */
 	onTimeout?: () => void;
@@ -474,6 +476,8 @@ export type { ContextUsage };
 export interface CompactOptions {
 	onComplete?: (result: CompactionResult) => void;
 	onError?: (error: Error) => void;
+	/** Await a successful post-compaction mutation before queued turns resume. */
+	beforeResume?: () => Promise<void>;
 	/**
 	 * Force a one-off compaction mode for this invocation, replacing the
 	 * configured `compaction.methodOrder` (`/compact soft`, `remote`, or

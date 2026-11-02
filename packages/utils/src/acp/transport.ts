@@ -176,6 +176,7 @@ export class RpcConnection {
 		method: string,
 		params?: unknown,
 	): {
+		id?: number;
 		promise: Promise<Response>;
 		cancel(): void;
 	} {
@@ -187,6 +188,7 @@ export class RpcConnection {
 		}
 		const { id, deferred } = this.#beginRequest(method, params);
 		return {
+			id,
 			promise: deferred.promise as Promise<Response>,
 			cancel: () => {
 				if (!this.#pending.delete(id)) return;

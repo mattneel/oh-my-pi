@@ -214,11 +214,50 @@ explicit channel sends only ordinary TSP: no DA1 sentinel, terminal capability
 probes, environment-based detection or optimistic row fallback. Its hello
 reply must select the supported protocol version before presentation starts.
 The shared `ChatTranscriptBuilder` supplies recorded and live assistant/tool
-components; the existing reconciler, credits, blobs, themes and component
-input handlers are unchanged. ACP owns session control and elicitation.
-Session creation remains headless (`hasUI: false`), with its existing ACP
-extension-UI/elicitation bridge unchanged; no `ProcessTerminal`, composer or
+components; the existing reconciler, credits, blobs and themes remain in use.
+ACP owns session control and elicitation. No `ProcessTerminal`, composer or
 interactive startup is created. One backend presents the selected ACP session.
+Tool UI still uses the ACP extension-UI/elicitation bridge; whether tools can
+ask a question depends on the client's advertised elicitation capability.
+
+#### ACP cockpit extensions
+
+The hello reply's optional `viewers` feature enables the multiplayer cockpit;
+`keys` additionally enables bounded key events. These features do not change
+ordinary Tern/interactive presentation. The shared inline `omp.session` surface
+keeps its main transcript, status/working dock and shared layer. Each
+window-local picker or Agents hub has a separate inline `omp.viewer` surface,
+opened with `viewer` and ID `v.<viewer>.<n>`. The host authenticates that audience
+and filters outgoing surfaces; the backend maintains independent reconciliation,
+focus, overlays and input ownership. Closing a picker emits a normal surface
+close, and `{ev:"viewer",viewer,present:false}` disposes its viewer hosts.
+
+Semantic events carry `viewer` through to components. Actions may carry `item`,
+`values` and object-valued `value`; `key` carries `{sf,viewer,data}` only to that
+viewer's focused component and accepts at most 4 KiB. Shared dock actions
+`model`, `effort` and `agents` open viewer UI; `interrupt`, tool approval
+`allow`/`always`/`deny`, and `questions` `submit` are host-intercepted ACP
+controls, not alternate completion paths.
+
+`ChatTranscriptBuilderDeps.nativeIdentity` opts into durable wire `p.key` and
+explicit persisted Yard display metadata. Assistant messages receive a reserved
+`sessionEntryId` before live events; persistence uses that same entry ID, and
+legacy loaded entries derive it from their entry wrapper. Segments use
+`<entryId>:before` and `<entryId>:after:<toolCallId>`. User keys come from
+`clankyard.turnId`, with `clankyard.displayText` rendered separately from
+`clankyard.context` (a collapsed `clankyard.context` section). Stored model
+content is not rewritten for display. Tool keys remain `toolCallId`.
+
+`retainFullToolContent` opts into complete native tool bodies, independently of
+collapse/preview props, and individual read cards rather than grouped reads.
+Both builder options are enabled by ACP only after `viewers` negotiation.
+`setToolPermission(toolCallId,state)` retains pending or settled ACP approval
+props even before a card exists; `undefined` clears them. Cards publish
+`status:"ask"`, `confirm`, `ask` and settled `approved` without handling approval
+actions. The `questions` kind projects ACP forms with the stable
+`question:<native id>` key, multi-select/recommended/free-text fields and
+read-only settled answers. See [ACP presentation](./cli-reference.md#acp-presentation)
+for prompt metadata and host control routing.
 
 #### Explicit composer submission
 

@@ -26,6 +26,8 @@ import {
 	cfgTerminalShowImages,
 } from "../settings";
 import { cfgReadToolResultPreview } from "../../tools/settings";
+import { AcpCockpit } from "./acp-cockpit";
+import { type AcpInteractionProjection, getAcpInteractionProjection } from "./acp-interactions";
 
 const ACP_TSP_INPUT_LIMITS = {
 	maxMessageBytes: 16 * 1024 * 1024,
@@ -37,6 +39,10 @@ const ACP_TSP_INPUT_LIMITS = {
 export class AcpPresentation {
 	readonly #transport: TspTransport;
 	readonly #backend: NativeBackend;
+	readonly #viewersEnabled: boolean;
+	#cockpit: AcpCockpit | undefined;
+	#interactions: AcpInteractionProjection | undefined;
+	#unsubscribeInteractions: (() => void) | undefined;
 	readonly imageBudget = new ImageBudget(0, () => this.requestRender());
 	lastFrameCostMs = 0;
 	#builder: ChatTranscriptBuilder | undefined;
@@ -64,26 +70,36 @@ export class AcpPresentation {
 
 	constructor(transport: TspTransport, hello: TspHello) {
 		this.#transport = transport;
+		this.#viewersEnabled = hello.features?.includes("viewers") ?? false;
 		if (transport.appearance) onTerminalAppearanceChange(transport.appearance);
 		const host: NativeHost = {
 			terminal: transport,
-			describeSurface: () => ({ main: this.#builder?.container.nativeBlocks() ?? [], dock: [] }),
+			describeSurface: () => {
+				const main = this.#builder?.container.nativeBlocks() ?? [];
+				return { main: this.#interactions?.decorate(main) ?? main, dock: this.#cockpit ? [this.#cockpit] : [] };
+			},
 			overlays: () => [],
 			focused: () => this.#focused,
 			focusFromPointer: (owners, field) => {
 				this.#focused = field ?? owners[0] ?? null;
 			},
 			requestRender: () => this.requestRender(),
+			viewerLeft: viewer => this.#cockpit?.viewerLeft(viewer),
 			appearanceChanged: dark => {
 				onTerminalAppearanceChange(dark ? "dark" : "light");
 				this.#builder?.container.invalidate();
+				this.#cockpit?.invalidate();
 				this.requestRender();
 			},
 			motionChanged: () => {
 				this.#builder?.container.invalidate();
+				this.#cockpit?.invalidate();
 				this.requestRender();
 			},
-			invalidate: () => this.#builder?.container.invalidate(),
+			invalidate: () => {
+				this.#builder?.container.invalidate();
+				this.#cockpit?.invalidate();
+			},
 		};
 		this.#backend = new NativeBackend(host, hello, { inputLimits: ACP_TSP_INPUT_LIMITS });
 		this.#backend.start();
@@ -107,11 +123,14 @@ export class AcpPresentation {
 	showSession(session: AgentSession, refresh = false): void {
 		if (this.#closed || (!refresh && session === this.#session && session.sessionId === this.#sessionId)) return;
 		try {
-			this.#detach();
+			const preserveCockpit = session === this.#session && session.sessionId === this.#sessionId;
+			this.#detach(preserveCockpit);
 			this.#session = session;
 			this.#sessionId = session.sessionId;
 			const builder = new ChatTranscriptBuilder({
 				ui: this,
+				nativeIdentity: this.#viewersEnabled,
+				retainFullToolContent: this.#viewersEnabled,
 				cwd: session.sessionManager.getCwd(),
 				getTool: name => session.getToolByName(name),
 				isBuiltInTool: name => session.hasBuiltInTool(name),
@@ -142,6 +161,17 @@ export class AcpPresentation {
 				requestRender: () => this.requestRender(),
 			});
 			this.#builder = builder;
+			if (this.#viewersEnabled) {
+				this.#cockpit ??= new AcpCockpit(session, this.#backend, this.#transport, () => this.requestRender());
+				this.#interactions = getAcpInteractionProjection(session);
+				const syncInteractions = () => {
+					for (const [id, permission] of this.#interactions?.permissions ?? [])
+						builder.setToolPermission(id, permission);
+					this.requestRender();
+				};
+				this.#unsubscribeInteractions = this.#interactions.subscribe(syncInteractions);
+				syncInteractions();
+			}
 			// Use the same deobfuscated, display-normalized history as interactive replay,
 			// including custom display flags and summaries at their recorded positions.
 			const collapseCompactedHistory = cfgDisplayCollapseCompacted.get(session.settings);
@@ -210,6 +240,7 @@ export class AcpPresentation {
 	}
 
 	#handleEvent(event: AgentSessionEvent, builder: ChatTranscriptBuilder): void {
+		this.#cockpit?.handleEvent(event);
 		switch (event.type) {
 			case "message_start":
 				if (event.message.role === "assistant") builder.updateAssistant(event.message);
@@ -268,6 +299,7 @@ export class AcpPresentation {
 				});
 				break;
 			}
+			case "manual_compaction_end":
 			case "auto_compaction_end":
 				if (event.result && this.#session) this.showSession(this.#session, true);
 				break;
@@ -298,6 +330,7 @@ export class AcpPresentation {
 
 	resetDisplay(): void {
 		this.#builder?.container.invalidate();
+		this.#cockpit?.invalidate();
 		this.requestRender();
 	}
 
@@ -325,7 +358,14 @@ export class AcpPresentation {
 		this.lastFrameCostMs = performance.now() - started;
 	}
 
-	#detach(): void {
+	#detach(preserveCockpit = false): void {
+		this.#unsubscribeInteractions?.();
+		this.#unsubscribeInteractions = undefined;
+		this.#interactions = undefined;
+		if (!preserveCockpit) {
+			this.#cockpit?.dispose();
+			this.#cockpit = undefined;
+		}
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		this.#builder?.dispose();
