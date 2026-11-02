@@ -66,6 +66,7 @@ import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } fro
 import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
+import type { PromptOptions } from "../../session/agent-session-types";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
@@ -96,6 +97,9 @@ import {
 } from "./acp-event-mapper";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 import type { AcpPresentation } from "./acp-presentation";
+import { getAcpInteractionProjection, type AcpInteractionProjection } from "./acp-interactions";
+import { bindAcpPresentationRuntime } from "./acp-cockpit";
+import type { EventBusLike } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 
 import { cfgDisabledExtensions } from "../../extensibility/settings";
 import { cfgPlanEnabled } from "../../plan-mode/settings";
@@ -396,6 +400,8 @@ type ManagedSessionRecord = {
 
 type ReplayableMessage = {
 	role: string;
+	sessionEntryId?: string;
+	clankyard?: PromptOptions["clankyard"];
 	content?: unknown;
 	errorMessage?: string;
 	toolCallId?: string;
@@ -430,6 +436,8 @@ type MCPSourceMap = {
 type AcpSessionHandle = {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+	eventBus?: EventBusLike;
+	subagentEventBus?: EventBusLike;
 };
 
 type CreateAcpSession = (
@@ -441,7 +449,11 @@ function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
 	session: AgentSession;
 	setToolUIContext: AcpSessionHandle["setToolUIContext"] | undefined;
 } {
-	return "session" in created ? created : { session: created, setToolUIContext: undefined };
+	if ("session" in created) {
+		bindAcpPresentationRuntime(created.session, created);
+		return created;
+	}
+	return { session: created, setToolUIContext: undefined };
 }
 
 type AcpSpeechOption = {
@@ -512,26 +524,7 @@ function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
 	};
 }
 
-/**
- * Bridge an ExtensionUIContext form to ACP `unstable_createElicitation`.
- *
- * `dialogOptions.signal` short-circuits the elicitation if it is already
- * aborted and races the in-flight request against the abort event. The SDK
- * exposes no `cancel_elicitation` surface for form-mode elicitations
- * (`unstable_completeElicitation` is URL-mode only), so the ACP request itself
- * keeps running on the client side until the user dismisses it — but
- * resolving the local promise unblocks the caller (matches the RPC mode
- * pattern in `requestRpcEditor`). The abort listener is removed once the
- * elicitation settles so that callers which reuse the same signal across many
- * elicitations don't accumulate listeners and trip Node's `MaxListeners`
- * warning.
- *
- * `dialogOptions.timeout` mirrors `RpcExtensionUIContext.#createDialogPromise`:
- * when the timer fires before the client responds, `onTimeout` is invoked and
- * the caller's promise resolves to the stub fallback. Late SDK responses that
- * arrive after abort/timeout — both rejections and successful `accept`s —
- * are dropped silently (no `logger.warn`) to keep operator logs clean.
- */
+/** Project the actual ACP request id; cancellation also closes the client-side request. */
 async function elicitFormFromAcpClient(
 	connection: AgentSideConnection,
 	sessionId: string,
@@ -540,11 +533,28 @@ async function elicitFormFromAcpClient(
 	properties: Record<string, ElicitationPropertySchema>,
 	required: string[] | undefined,
 	dialogOptions: ExtensionUIDialogOptions | undefined,
+	interactions?: AcpInteractionProjection,
+	lifetimeSignal?: AbortSignal,
 ): Promise<Record<string, ElicitationContentValue> | undefined> {
-	const signal = dialogOptions?.signal;
+	const signal =
+		dialogOptions?.signal && lifetimeSignal
+			? AbortSignal.any([dialogOptions.signal, lifetimeSignal])
+			: (dialogOptions?.signal ?? lifetimeSignal);
 	if (signal?.aborted) {
 		return undefined;
 	}
+	const request = {
+		mode: "form" as const,
+		sessionId,
+		message,
+		requestedSchema: { type: "object" as const, properties, required },
+		...(dialogOptions?.toolCallId ? { _meta: { "omp/toolCallId": dialogOptions.toolCallId } } : {}),
+	};
+	const pending = connection.unstable_createElicitationWithCancel(request);
+	const settleProjection =
+		pending.id === undefined
+			? undefined
+			: interactions?.questionRequested(pending.id, request, dialogOptions?.toolCallId);
 	const { promise, resolve } = Promise.withResolvers<CreateElicitationResponse | undefined>();
 	let settled = false;
 	let timeoutId: NodeJS.Timeout | undefined;
@@ -553,6 +563,8 @@ async function elicitFormFromAcpClient(
 		settled = true;
 		clearTimeout(timeoutId);
 		signal?.removeEventListener("abort", onAbort);
+		if (value === undefined) pending.cancel();
+		settleProjection?.(value);
 		resolve(value);
 	};
 	const onAbort = () => finish(undefined);
@@ -575,23 +587,12 @@ async function elicitFormFromAcpClient(
 		// loop alive on the happy path.
 		timeoutId.unref();
 	}
-	connection
-		.unstable_createElicitation({
-			mode: "form",
-			sessionId,
-			message,
-			requestedSchema: {
-				type: "object",
-				properties,
-				required,
-			},
-		})
-		.then(finish, error => {
-			// Caller may already have moved on via abort/timeout; suppress noise.
-			if (settled) return;
-			logger.warn("ACP elicitation failed", { acpSessionId: sessionId, method, error });
-			finish(undefined);
-		});
+	pending.promise.then(finish, error => {
+		// Caller may already have moved on via abort/timeout; suppress noise.
+		if (settled) return;
+		logger.warn("ACP elicitation failed", { acpSessionId: sessionId, method, error });
+		finish(undefined);
+	});
 	const response = await promise;
 	if (!isAcceptedElicitation(response) || !response.content) {
 		return undefined;
@@ -606,6 +607,8 @@ async function elicitFromAcpClient(
 	message: string,
 	property: ElicitationPropertySchema,
 	dialogOptions: ExtensionUIDialogOptions | undefined,
+	interactions?: AcpInteractionProjection,
+	lifetimeSignal?: AbortSignal,
 ): Promise<ElicitationContentValue | undefined> {
 	const content = await elicitFormFromAcpClient(
 		connection,
@@ -615,6 +618,8 @@ async function elicitFromAcpClient(
 		{ value: property },
 		["value"],
 		dialogOptions,
+		interactions,
+		lifetimeSignal,
 	);
 	return content?.value;
 }
@@ -641,6 +646,8 @@ export function createAcpExtensionUiContext(
 	connection: AgentSideConnection,
 	getSessionId: () => string,
 	clientCapabilities: ClientCapabilities | undefined,
+	interactions?: AcpInteractionProjection,
+	getLifetimeSignal?: () => AbortSignal | undefined,
 ): ExtensionUIContext {
 	const supportsForm = clientCapabilities?.elicitation?.form != null;
 	return {
@@ -654,6 +661,8 @@ export function createAcpExtensionUiContext(
 				title,
 				{ type: "string", enum: options.map(getExtensionUISelectOptionLabel) },
 				dialogOptions,
+				interactions,
+				getLifetimeSignal?.(),
 			);
 			return typeof value === "string" ? value : undefined;
 		},
@@ -666,6 +675,8 @@ export function createAcpExtensionUiContext(
 				message.trim().length > 0 ? `${title}\n\n${message}` : title,
 				{ type: "boolean" },
 				dialogOptions,
+				interactions,
+				getLifetimeSignal?.(),
 			);
 			return typeof value === "boolean" ? value : false;
 		},
@@ -684,6 +695,8 @@ export function createAcpExtensionUiContext(
 				// Empty / whitespace-only placeholders are treated as absent.
 				{ type: "string", ...(placeholder?.trim() ? { description: placeholder } : {}) },
 				dialogOptions,
+				interactions,
+				getLifetimeSignal?.(),
 			);
 			return typeof value === "string" ? value : undefined;
 		},
@@ -705,6 +718,11 @@ export function createAcpExtensionUiContext(
 							title: question.question,
 							...(description ? { description } : {}),
 							items: { anyOf: entries },
+							...(question.recommended !== undefined &&
+							question.recommended >= 0 &&
+							question.recommended < question.options.length
+								? { default: [question.options[question.recommended].label] }
+								: {}),
 						};
 					} else {
 						const recommended = question.recommended;
@@ -718,6 +736,12 @@ export function createAcpExtensionUiContext(
 								: {}),
 						};
 					}
+				} else {
+					properties[key] = {
+						type: "string",
+						title: question.question,
+						...(description ? { description } : {}),
+					};
 				}
 				properties[`${key}__other`] = { type: "string", title: OTHER_OPTION };
 			}
@@ -737,6 +761,8 @@ export function createAcpExtensionUiContext(
 						dialogOptions?.onTimeout?.();
 					},
 				},
+				interactions,
+				getLifetimeSignal?.(),
 			);
 			if (timedOut) return timedOutAskDialogResult(questions);
 			if (!content) return undefined;
@@ -748,8 +774,19 @@ export function createAcpExtensionUiContext(
 					const otherKey = `${key}__other`;
 					const labels = question.options.map(option => option.label);
 					const otherValue = content[otherKey];
-					const customInput = typeof otherValue === "string" && otherValue.trim() ? otherValue.trim() : undefined;
 					const value = content[key];
+					// Tern returns free text in the question's answer, while ACP form
+					// clients may use the companion qN__other property.
+					const freeText =
+						typeof value === "string" && !labels.includes(value)
+							? value
+							: Array.isArray(value)
+								? value.filter(candidate => !labels.includes(candidate)).join("\n")
+								: undefined;
+					const customInput =
+						typeof otherValue === "string" && otherValue.trim()
+							? otherValue.trim()
+							: freeText?.trim() || undefined;
 					const selectedOptions =
 						question.multi === true
 							? Array.isArray(value)
@@ -794,6 +831,8 @@ export function createAcpExtensionUiContext(
 				title,
 				{ type: "string", ...(prefill ? { default: prefill } : {}) },
 				dialogOptions,
+				interactions,
+				getLifetimeSignal?.(),
 			);
 			return typeof value === "string" ? value : undefined;
 		},
@@ -1086,7 +1125,7 @@ export class AcpAgent implements Agent {
 				}
 				this.#throwIfRecordClosed(record);
 
-				const converted = this.#convertPromptBlocks(params.prompt);
+				const converted = this.#convertPromptBlocks(params.prompt, params._meta);
 				const pendingPrompt = Promise.withResolvers<PromptResponse>();
 				record.promptTurn = {
 					abortController: new AbortController(),
@@ -1130,18 +1169,20 @@ export class AcpAgent implements Agent {
 				// guard above cannot fire and a client prompt lands on AgentSession's busy
 				// guard. Type that failure for the wire instead of letting transport.ts wrap
 				// it as a generic -32603 internal error.
-				this.#runPromptOrCommand(record, converted.text, converted.images).catch((error: unknown) => {
-					this.#finishPrompt(
-						record,
-						undefined,
-						error instanceof AgentBusyError
-							? RequestError.sessionBusy(error.message, {
-									reason: "session_busy",
-									hint: "steer|followUp|wait",
-								})
-							: error,
-					);
-				});
+				this.#runPromptOrCommand(record, converted.text, converted.images, converted.clankyard).catch(
+					(error: unknown) => {
+						this.#finishPrompt(
+							record,
+							undefined,
+							error instanceof AgentBusyError
+								? RequestError.sessionBusy(error.message, {
+										reason: "session_busy",
+										hint: "steer|followUp|wait",
+									})
+								: error,
+						);
+					},
+				);
 
 				return await pendingPrompt.promise;
 			});
@@ -1218,7 +1259,12 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #runPromptOrCommand(record: ManagedSessionRecord, text: string, images: AgentImageContent[]): Promise<void> {
+	async #runPromptOrCommand(
+		record: ManagedSessionRecord,
+		text: string,
+		images: AgentImageContent[],
+		clankyard?: PromptOptions["clankyard"],
+	): Promise<void> {
 		const promptTurn = record.promptTurn;
 		const skillResult = await this.#tryRunSkillCommand(record, text);
 		if (skillResult || promptTurn?.cancelRequested) {
@@ -1277,7 +1323,10 @@ export class AcpAgent implements Agent {
 			notifyConfigChanged: async options => {
 				// Once lifetime delivery is ready, model/thinking events already
 				// push the config update. Keep the pre-bootstrap explicit path.
-				if (options?.handledBySessionEvent && record.lifetimeUpdatesReady) {
+				if (
+					(options?.handledBySessionEvent || /^\/model(?:\s|$)/.test(text.trim())) &&
+					record.lifetimeUpdatesReady
+				) {
 					await this.#waitForPromptEventHandlers(record);
 					return;
 				}
@@ -1313,7 +1362,7 @@ export class AcpAgent implements Agent {
 		}
 
 		const extensionPromptBaseline = new Set(record.extensionUserMessageTasks);
-		const agentInvoked = await record.session.prompt(text, { images });
+		const agentInvoked = await record.session.prompt(text, { images, clankyard });
 		// Extension and custom-TS commands are handled locally inside session.prompt().
 		// An ACP extension command can still call pi.sendUserMessage(), which starts
 		// an async nested prompt through the extension runtime. Keep the ACP turn
@@ -1579,14 +1628,22 @@ export class AcpAgent implements Agent {
 		this.#throwIfRecordClosed(record);
 
 		const promptBlocks = toSteeringPromptBlocks(params.prompt);
-		const converted = this.#convertPromptBlocks(promptBlocks);
+		const converted = this.#convertPromptBlocks(
+			promptBlocks,
+			typeof params._meta === "object" && params._meta !== null
+				? (params._meta as Record<string, unknown>)
+				: undefined,
+		);
 		if (converted.text.length === 0 && converted.images.length === 0) {
 			throw RequestError.invalidParams({ method: SESSION_STEERING_METHOD }, "prompt is empty");
 		}
 		const queue = steeringQueueFromMeta(params._meta);
 
 		try {
-			const admitted = await record.session.joinActiveTurn(converted.text, converted.images, { queue });
+			const admitted = await record.session.joinActiveTurn(converted.text, converted.images, {
+				queue,
+				clankyard: converted.clankyard,
+			});
 			if (!admitted) {
 				// Not admitted only when no client prompt owns the turn:
 				// idle (nothing to inject into — the host resubmits
@@ -1753,7 +1810,12 @@ export class AcpAgent implements Agent {
 		// Registered before extensions start: a `session_start` handler can already replace the durable session.
 		session.registerSessionChangeCallback(() => this.#rememberHandleSession(record));
 		session.setClientBridge(
-			createAcpClientBridge(this.#connection, record.protocolSessionId, this.#clientCapabilities),
+			createAcpClientBridge(
+				this.#connection,
+				record.protocolSessionId,
+				this.#clientCapabilities,
+				getAcpInteractionProjection(session),
+			),
 		);
 		// Client-declared servers live in `record.mcpManager`, not the session's
 		// own (ACP sessions run with `enableMCP: false`); read it live so every
@@ -1830,7 +1892,11 @@ export class AcpAgent implements Agent {
 				record.lifetimeUpdatesReady &&
 				(event.type === "thinking_level_changed" || event.type === "model_changed")
 			) {
-				this.#trackLifetimeDelivery(record, event.type, this.#pushConfigOptionUpdate(record));
+				const notify = () => {
+					if (!record.closedError)
+						this.#trackLifetimeDelivery(record, event.type, this.#pushConfigOptionUpdate(record));
+				};
+				if (!getAcpInteractionProjection(record.session).deferConfigUpdate(notify)) notify();
 			}
 			return;
 		}
@@ -2075,7 +2141,7 @@ export class AcpAgent implements Agent {
 			event.message.role === "assistant" &&
 			(event.type === "message_start" || !record.liveMessageId || !record.liveMessageProgress)
 		) {
-			record.liveMessageId = crypto.randomUUID();
+			record.liveMessageId = event.message.sessionEntryId ?? crypto.randomUUID();
 			record.liveMessageProgress = { textEmitted: false, thoughtEmitted: false };
 		}
 	}
@@ -2099,7 +2165,10 @@ export class AcpAgent implements Agent {
 		if (typeof message !== "object" || message === null) {
 			return undefined;
 		}
-		record.liveMessageId ??= crypto.randomUUID();
+		record.liveMessageId ??=
+			"sessionEntryId" in message && typeof message.sessionEntryId === "string"
+				? message.sessionEntryId
+				: crypto.randomUUID();
 		return record.liveMessageId;
 	}
 
@@ -2181,7 +2250,10 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	#convertPromptBlocks(blocks: PromptRequest["prompt"]): { text: string; images: AgentImageContent[] } {
+	#convertPromptBlocks(
+		blocks: PromptRequest["prompt"],
+		meta?: Record<string, unknown> | null,
+	): { text: string; images: AgentImageContent[]; clankyard?: PromptOptions["clankyard"] } {
 		const textParts: string[] = [];
 		const images: AgentImageContent[] = [];
 		for (const block of blocks) {
@@ -2225,9 +2297,26 @@ export class AcpAgent implements Agent {
 					break;
 			}
 		}
+		const contextBlocks = blocks.filter(
+			block => block.type === "text" && block._meta?.["clankyard/role"] === "context",
+		);
+		const turnId = typeof meta?.["clankyard/turn"] === "string" ? meta["clankyard/turn"] : undefined;
+		const clankyard =
+			contextBlocks.length > 0 || turnId
+				? {
+						...(turnId ? { turnId } : {}),
+						...(contextBlocks.length
+							? { context: contextBlocks.map(block => (block.type === "text" ? block.text : "")).join("\n\n") }
+							: {}),
+						displayText: contextBlocks.length
+							? this.#convertPromptBlocks(blocks.filter(block => !contextBlocks.includes(block))).text
+							: textParts.join("\n\n").trim(),
+					}
+				: undefined;
 		return {
 			text: textParts.join("\n\n").trim(),
 			images,
+			...(clankyard ? { clankyard } : {}),
 		};
 	}
 
@@ -2531,6 +2620,7 @@ export class AcpAgent implements Agent {
 		const previewLines = planContent.split("\n").slice(0, 12).join("\n");
 		const ellipsis = planContent.split("\n").length > 12 ? "\n…" : "";
 		const message = `Approve plan "${title}" and start implementation?\n\n${previewLines}${ellipsis}`;
+		const record = this.#sessions.get(sessionId);
 		const value = await elicitFromAcpClient(
 			this.#connection,
 			sessionId,
@@ -2538,6 +2628,8 @@ export class AcpAgent implements Agent {
 			message,
 			{ type: "string", enum: [APPROVE_OPTION, REFINE_OPTION] },
 			undefined,
+			record ? getAcpInteractionProjection(record.session) : undefined,
+			record?.promptTurn?.abortController.signal,
 		);
 		// Approve ONLY on the explicit approve selection. Dismissal, cancel,
 		// timeout, or any other non-approve response falls through to refine
@@ -2818,7 +2910,7 @@ export class AcpAgent implements Agent {
 				sessionId,
 				this.#extractReplayContent(message.content, undefined),
 				"user_message_chunk",
-				crypto.randomUUID(),
+				message.clankyard?.turnId ?? crypto.randomUUID(),
 			);
 		}
 		if (
@@ -2863,7 +2955,7 @@ export class AcpAgent implements Agent {
 		replayedToolCallArgs: Map<string, unknown>,
 	): SessionNotification[] {
 		const notifications: SessionNotification[] = [];
-		const messageId = crypto.randomUUID();
+		const messageId = message.sessionEntryId ?? crypto.randomUUID();
 		if (Array.isArray(message.content)) {
 			for (const item of message.content) {
 				if (typeof item !== "object" || item === null || !("type" in item)) {
@@ -3053,6 +3145,8 @@ export class AcpAgent implements Agent {
 			this.#connection,
 			() => record.protocolSessionId,
 			this.#clientCapabilities,
+			getAcpInteractionProjection(record.session),
+			() => record.promptTurn?.abortController.signal,
 		);
 		if (this.#clientCapabilities?.elicitation?.form != null) {
 			record.setToolUIContext?.(uiContext, true);

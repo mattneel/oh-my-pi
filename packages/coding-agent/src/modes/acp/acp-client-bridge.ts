@@ -23,11 +23,13 @@ import type {
 	ClientBridgePermissionToolCall,
 	ClientBridgeTerminalHandle,
 } from "../../session/client-bridge";
+import type { AcpInteractionProjection } from "./acp-interactions";
 
 export function createAcpClientBridge(
 	connection: AgentSideConnection,
 	sessionId: string,
 	clientCapabilities: ClientCapabilities | undefined,
+	interactions?: AcpInteractionProjection,
 ): ClientBridge {
 	const capabilities: ClientBridgeCapabilities = {
 		readTextFile: clientCapabilities?.fs?.readTextFile === true,
@@ -67,8 +69,19 @@ export function createAcpClientBridge(
 			createTerminalHandle(connection, sessionId, params);
 	}
 
-	bridge.requestPermission = (toolCall, options, signal, steeringSignal) =>
-		requestPermission(connection, sessionId, toolCall, options, signal, steeringSignal);
+	bridge.requestPermission = async (toolCall, options, signal, steeringSignal) => {
+		if (signal?.aborted || steeringSignal?.aborted) return { outcome: "cancelled" };
+		const settle = interactions?.permissionRequested(toolCall, options);
+		let outcome: ClientBridgePermissionOutcome | undefined;
+		const cancellation =
+			signal && steeringSignal ? AbortSignal.any([signal, steeringSignal]) : (signal ?? steeringSignal);
+		try {
+			outcome = await requestPermission(connection, sessionId, toolCall, options, signal, cancellation);
+			return outcome;
+		} finally {
+			settle?.(outcome);
+		}
+	};
 
 	return bridge;
 }

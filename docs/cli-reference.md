@@ -285,6 +285,78 @@ that duplex channel. The most recently created, loaded, resumed, forked or
 prompted session is presented. Prompts, permissions and elicitation remain ACP
 operations; this does not enable terminal-interactive startup.
 
+#### Multiplayer cockpit negotiation
+
+Cockpit behavior is opt-in. The host's hello reply must list `viewers` in
+`features`; it may additionally list `keys` to forward keyboard input. Without
+`viewers`, the side channel keeps its ordinary transcript-only behavior, including
+Tern's existing folds. No interactive terminal, `InteractiveMode` or composer is
+created in ACP mode.
+
+With `viewers`, the shared `omp.session` surface contains the transcript and a
+dock with model, effort, context, cost, Agents and the running turn's Stop
+control. Model/effort pickers and the live Agents hub open per-window inline
+surfaces with role `omp.viewer`, a `viewer` audience and IDs
+`v.<viewer>.<n>`. The hub's transcript is read-only; opening it does not switch
+the shared conversation. The host assigns viewer identities, routes each viewer
+surface only to its audience, and injects `viewer` on input events. A departure
+event `{ev:"viewer",viewer,present:false}` disposes that window's UI.
+An event cannot address another viewer's surface.
+
+When both `viewers` and `keys` are negotiated, a host can send
+`{ev:"key",sf,viewer,data}` to the viewer surface's focused component; `data`
+is a key sequence of at most 4 KiB. Keys never go to ACP stdin. Ordinary
+`select`, `activate`, `action`, `change` and `focus` events remain semantic TSP
+events; actions can carry `item`, `values` and object-valued `value`.
+Folding, copying, opening links and zooming stay local to the window.
+
+Stop, approvals and questions **still complete through ACP only**. The host
+intercepts `interrupt` and cancels through ACP. A pending
+`session/request_permission` sets its tool card to `status:"ask"` with
+`confirm:"card"` and `ask` labels, even if the request arrives before the
+card. The host correlates `allow`, `always` and `deny` actions by the card's
+`p.key` (the tool call ID), then answers the original ACP request. Settled
+cards expose `approved:"once"|"session"|"always"|"denied"`.
+An `elicitation/create` form appears as a `questions` node keyed
+`question:<native JSON-RPC id>`. Its `submit` action's `value` contains the
+answers; the host answers the pending ACP request, and the presentation becomes
+read-only when answered or cancelled. TSP clicks themselves never authorize a
+tool or resolve an elicitation.
+The request may carry `_meta["omp/toolCallId"]` for exact placement after the
+asking tool; its JSON-RPC id, not that tool ID, remains the question identity.
+ACP's existing `allow_always` grant is session-lifetime and is displayed as
+`approved:"session"`; it does not create a persistent approval policy.
+
+#### Durable transcript keys and Yard context
+
+For negotiated cockpit hosts, user cards take their `p.key` from
+`session/prompt` `_meta["clankyard/turn"]`. Assistant keys use the durable
+session entry ID plus `:before` or `:after:<toolCallId>` for post-tool prose,
+identically during streaming, reload and ACP replay. Tool keys remain the
+tool call ID; roles remain semantic (`omp.user`, `omp.assistant`,
+`omp.tool.<name>`). Use these keys rather than process-local node IDs for
+permalinks and per-window fold state.
+
+A Yard can explicitly separate context from the visible message:
+
+```json
+{
+  "_meta": {"clankyard/turn": "turn-42"},
+  "prompt": [
+    {"type": "text", "text": "Yard context", "_meta": {"clankyard/role": "context"}},
+    {"type": "text", "text": "The user's message"}
+  ]
+}
+```
+
+Text blocks reach the model joined by a blank line, unchanged. Structured turn
+and display metadata are persisted separately: the user card shows the message,
+and context appears in a collapsed section titled **Yard context**, role
+`clankyard.context`. No generic prompt text is guessed or split on blank lines.
+Cockpit tool bodies also retain all content while collapsed: `collapsed` and
+`preview` affect display only, so each window can unfold independently without
+asking omp to reconstruct the body.
+
 An explicit target that cannot be opened or connected, or does not complete
 the hello negotiation, fails startup with a diagnostic. A later disconnect
 stops presentation and logs the condition while ACP continues; there is no

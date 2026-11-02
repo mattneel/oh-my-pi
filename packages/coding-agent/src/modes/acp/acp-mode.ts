@@ -4,6 +4,7 @@ import { getLogsDir, postmortem } from "@oh-my-pi/pi-utils";
 import { AgentSideConnection, ndJsonStream, type Stream } from "@oh-my-pi/pi-utils/acp";
 import type { ExtensionUIContext } from "../../extensibility/extensions/types";
 import type { AgentSession } from "../../session/agent-session";
+import type { EventBusLike } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { AcpAgent } from "./acp-agent";
 import { AcpPresentation } from "./acp-presentation";
 
@@ -11,6 +12,8 @@ import { AcpPresentation } from "./acp-presentation";
 export interface AcpSessionHandle {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+	eventBus?: EventBusLike;
+	subagentEventBus?: EventBusLike;
 }
 
 /**

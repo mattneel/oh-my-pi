@@ -76,6 +76,8 @@ interface RpcMessage {
 	id?: unknown;
 	result?: Record<string, unknown>;
 	error?: unknown;
+	method?: string;
+	params?: Record<string, unknown>;
 }
 
 class CliProcess {
@@ -95,12 +97,13 @@ class CliProcess {
 		env: NodeJS.ProcessEnv,
 		inherited?: { fd: number; socket: Socket },
 		rpc = true,
+		isolation = cliIsolation,
 	) {
 		const stdio: StdioOptions = ["pipe", "pipe", "pipe"];
 		if (inherited) {
 			for (let i = 3; i <= inherited.fd; i++) stdio.push(i === inherited.fd ? inherited.socket : "ignore");
 		}
-		this.child = spawn(process.execPath, [cliEntry, ...args, ...cliIsolation], { cwd, env, stdio });
+		this.child = spawn(process.execPath, [cliEntry, ...args, ...isolation], { cwd, env, stdio });
 		processes.add(this);
 		this.child.on("error", error => this.changes.fail(error));
 		this.child.stdout?.setEncoding("utf8");
@@ -121,6 +124,8 @@ class CliProcess {
 							id: message.id,
 							result: isRecord(message.result) ? message.result : undefined,
 							error: message.error,
+							method: typeof message.method === "string" ? message.method : undefined,
+							params: isRecord(message.params) ? message.params : undefined,
 						});
 					}
 				} catch (error) {
@@ -150,7 +155,7 @@ class CliProcess {
 		const id = this.#nextId++;
 		this.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
 		const response = await this.changes.wait(`${method} response; stderr=${this.stderr}`, () => {
-			const message = this.messages.find(message => message.id === id);
+			const message = this.messages.find(message => message.id === id && message.method === undefined);
 			if (message) return message;
 			if (this.#exit) throw new Error(`CLI exited before ${method}: ${this.stderr}`);
 			return undefined;
@@ -182,7 +187,7 @@ class SideChannel extends TspTestTerminal {
 	closed = false;
 	#pending = "";
 
-	constructor(peer: Duplex) {
+	constructor(peer: Duplex, features: readonly string[] = ["blobs", "settle", "adopt", "dock"]) {
 		super({ autoAck: false });
 		this.peer = peer;
 		peers.add(peer);
@@ -209,7 +214,7 @@ class SideChannel extends TspTestTerminal {
 								v: 1,
 								term: "ordinary-acp-test-host",
 								kinds: TSP_KINDS,
-								features: ["blobs", "settle", "adopt", "dock"],
+								features,
 								cols: 100,
 								dark: true,
 								credits: 1,
@@ -237,9 +242,9 @@ class SideChannel extends TspTestTerminal {
 		this.send(encodeTspJson("e", event));
 	}
 
-	find(predicate: (node: TspNode) => boolean): TspNode | undefined {
-		if (!this.surface) return undefined;
-		const root = this.docs.get(this.surface)?.snapshot();
+	find(predicate: (node: TspNode) => boolean, surface = this.surface): TspNode | undefined {
+		if (!surface) return undefined;
+		const root = this.docs.get(surface)?.snapshot();
 		const visit = (node: TspNode): TspNode | undefined => {
 			if (predicate(node)) return node;
 			for (const child of node.c ?? []) {
@@ -251,8 +256,8 @@ class SideChannel extends TspTestTerminal {
 		return root ? visit(root) : undefined;
 	}
 
-	async waitForNode(predicate: (node: TspNode) => boolean): Promise<TspNode> {
-		return this.changes.wait("semantic transcript node", () => this.find(predicate));
+	async waitForNode(predicate: (node: TspNode) => boolean, surface?: string): Promise<TspNode> {
+		return this.changes.wait("semantic transcript node", () => this.find(predicate, surface));
 	}
 
 	assertValid(): void {
@@ -420,6 +425,196 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("ACP TSP side channel", () => {
+	it("negotiates the cockpit over a real CLI side channel while ACP exclusively settles confirm cards", async () => {
+		const { cwd, env } = await isolatedEnvironment();
+		let calls = 0;
+		const provider = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => {
+				const tool = calls++ === 0;
+				const events = [
+					{
+						type: "message_start",
+						message: {
+							id: `msg-${calls}`,
+							type: "message",
+							role: "assistant",
+							model: "transcript",
+							content: [],
+							stop_reason: null,
+							stop_sequence: null,
+							usage: { input_tokens: 8, output_tokens: 0 },
+						},
+					},
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: tool
+							? { type: "tool_use", id: "cli-confirm-tool", name: "bash", input: {} }
+							: { type: "text", text: "" },
+					},
+					tool
+						? {
+								type: "content_block_delta",
+								index: 0,
+								delta: {
+									type: "input_json_delta",
+									partial_json: JSON.stringify({ command: "printf cockpit-permission" }),
+								},
+							}
+						: {
+								type: "content_block_delta",
+								index: 0,
+								delta: { type: "text_delta", text: "CLI permission completed." },
+							},
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "message_delta",
+						delta: { stop_reason: tool ? "tool_use" : "end_turn", stop_sequence: null },
+						usage: { output_tokens: 8 },
+					},
+					{ type: "message_stop" },
+				];
+				return new Response(
+					events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+			},
+		});
+		try {
+			const modelsFile = path.join(env.PI_CODING_AGENT_DIR!, "models.yml");
+			// Use the same isolated real registry as the ordinary CLI tests, backed
+			// by a deterministic local protocol peer rather than a fake session.
+			const models = JSON.parse(await fs.readFile(modelsFile, "utf8"));
+			models.providers["acp-fixture"].baseUrl = provider.url.href;
+			models.providers["acp-fixture"].models.push({
+				...models.providers["acp-fixture"].models[0],
+				id: "transcript-alternate",
+				name: "Alternate transcript fixture",
+			});
+			await fs.writeFile(modelsFile, JSON.stringify(models));
+			const socketPath = path.join(cwd, "cockpit.sock");
+			const listener = await listen(socketPath);
+			const proc = new CliProcess(
+				["acp", "--tsp", socketPath, "--tools", "bash"],
+				cwd,
+				env,
+				undefined,
+				true,
+				cliIsolation.filter(flag => flag !== "--no-tools"),
+			);
+			const host = new SideChannel(await listener.connection, ["blobs", "settle", "dock", "viewers", "keys"]);
+			await proc.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+			const created = await proc.request("session/new", { cwd, mcpServers: [] });
+			await proc.changes.wait("bootstrap command catalogue", () =>
+				proc.messages.find(
+					message =>
+						isRecord(message.params?.update) &&
+						message.params.update.sessionUpdate === "available_commands_update",
+				),
+			);
+			const configUpdates = () =>
+				proc.messages.filter(
+					message =>
+						isRecord(message.params?.update) && message.params.update.sessionUpdate === "config_option_update",
+				);
+			const configBaseline = configUpdates().length;
+			const shared = host.surface!;
+			await host.waitForNode(node => node.p?.role === "omp.dock", shared);
+			const model = await host.waitForNode(node => node.p?.role === "omp.composer.model", shared);
+			host.event({ ev: "action", sf: shared, id: model.id, act: "model", viewer: "window-a", mods: [] });
+			const viewer = await host.changes.wait("audience-addressed model picker", () => {
+				const open = host.log.find(
+					message => message.verb === "o" && isRecord(message.body) && message.body.viewer === "window-a",
+				);
+				return open && isRecord(open.body) && typeof open.body.id === "string" ? open.body.id : undefined;
+			});
+			expect(viewer).toMatch(/^v\.window-a\./);
+			await host.waitForNode(node => node.k === "picker", viewer);
+			expect(host.find(node => node.k === "picker", shared)).toBeUndefined();
+			host.event({ ev: "key", sf: viewer, viewer: "window-a", data: "transcript" });
+			host.event({ ev: "action", sf: shared, id: model.id, act: "effort", viewer: "window-b", mods: [] });
+			const otherViewer = await host.changes.wait("second isolated viewer", () => {
+				const open = host.log.find(
+					message => message.verb === "o" && isRecord(message.body) && message.body.viewer === "window-b",
+				);
+				return open && isRecord(open.body) && typeof open.body.id === "string" ? open.body.id : undefined;
+			});
+			await host.waitForNode(node => node.k === "picker", otherViewer);
+			await host.waitForNode(node => node.k === "picker" && node.p?.query === "transcript", viewer);
+			expect(host.find(node => node.k === "picker", otherViewer)?.p).not.toHaveProperty("query", "transcript");
+			host.event({ ev: "key", sf: viewer, viewer: "window-b", data: "stolen" });
+			host.event({ ev: "viewer", viewer: "window-b", present: false });
+			await host.changes.wait("second viewer disposal", () =>
+				host.log.some(message => message.verb === "x" && isRecord(message.body) && message.body.id === otherViewer)
+					? true
+					: undefined,
+			);
+			expect(host.find(node => node.k === "picker", viewer)?.p).toHaveProperty("query", "transcript");
+			const picker = host.find(node => node.k === "picker", viewer);
+			if (picker?.k !== "picker") throw new Error("Model picker disappeared");
+			const alternate = picker.p?.items?.find(item => item.id.includes("transcript-alternate"));
+			if (!alternate) throw new Error("Real model catalogue omitted the alternate model");
+			host.event({ ev: "activate", sf: viewer, id: picker.id, item: alternate.id, viewer: "window-a" });
+			await host.changes.wait("viewer picker close", () =>
+				host.log.some(message => message.verb === "x" && isRecord(message.body) && message.body.id === viewer)
+					? true
+					: undefined,
+			);
+			await proc.changes.wait("one model config notification", () =>
+				configUpdates().length > configBaseline ? true : undefined,
+			);
+			expect(configUpdates()).toHaveLength(configBaseline + 1);
+			await proc.request("session/prompt", {
+				sessionId: created.result?.sessionId,
+				prompt: [{ type: "text", text: "/model acp-fixture/transcript" }],
+			});
+			expect(configUpdates()).toHaveLength(configBaseline + 2);
+			const prompt = proc.request("session/prompt", {
+				sessionId: created.result?.sessionId,
+				prompt: [{ type: "text", text: "Run the permission fixture." }],
+			});
+			void prompt.catch(() => {});
+			const permission = await proc.changes.wait("real ACP permission request", () =>
+				proc.messages.find(message => message.method === "session/request_permission"),
+			);
+			const card = await host.waitForNode(
+				node => node.k === "tool" && node.p?.key === "cli-confirm-tool" && node.p.status === "ask",
+				shared,
+			);
+			expect(card.p).toMatchObject({
+				confirm: "card",
+				ask: { allow: "Allow once", always: "Always allow", deny: "Reject" },
+			});
+			await host.waitForNode(node => node.p?.role === "omp.working.stop", shared);
+			await host.waitForNode(node => node.k === "spinner", shared);
+			await host.waitForNode(node => node.k === "elapsed", shared);
+			host.event({ ev: "action", sf: shared, id: card.id, act: "allow", mods: [] });
+			expect(calls).toBe(1);
+			proc.stdin.write(
+				`${JSON.stringify({ jsonrpc: "2.0", id: permission.id, result: { outcome: { outcome: "selected", optionId: "allow_once" } } })}\n`,
+			);
+			await prompt;
+			await host.waitForNode(
+				node =>
+					node.k === "tool" &&
+					node.p?.key === "cli-confirm-tool" &&
+					node.p.approved === "once" &&
+					node.p.status === "done",
+				shared,
+			);
+			const settled = host.find(node => node.k === "tool" && node.p?.key === "cli-confirm-tool", shared)!;
+			expect(settled.p).not.toHaveProperty("confirm");
+			expect(settled.p).not.toHaveProperty("ask");
+			expect(calls).toBe(2);
+			expect(configUpdates()).toHaveLength(configBaseline + 2);
+			await gracefulShutdown(proc, host);
+		} finally {
+			await provider.stop(true);
+		}
+	}, 60_000);
+
 	it("loads a real transcript over an ordinary Unix socket, applies native events, and releases it on ACP EOF", async () => {
 		const { cwd, env } = await isolatedEnvironment();
 		const sessionId = await seedSession(cwd, env);

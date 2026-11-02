@@ -523,6 +523,8 @@ export async function submitInteractiveInput(
 interface AcpSessionHandle {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+	eventBus?: EventBus;
+	subagentEventBus?: EventBus;
 }
 
 type AcpSessionFactory = (cwd: string, options?: { interactivePrompts?: boolean }) => Promise<AcpSessionHandle>;
@@ -593,7 +595,11 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		// Like every top-level session, it holds process-wide effects (`worktree.base`, request
 		// limits, …) on its own project's settings until disposed; its requests redact credentials
 		// per that project's `secrets.enabled` regardless of which session holds the effects.
-		const { session: nextSession, setToolUIContext } = await args.createSession({
+		const {
+			session: nextSession,
+			setToolUIContext,
+			subagentEventBus,
+		} = await args.createSession({
 			...args.baseOptions,
 			cwd,
 			sessionManager: nextSessionManager,
@@ -629,7 +635,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 				throw error;
 			}
 		}
-		return { session: nextSession, setToolUIContext };
+		return { session: nextSession, setToolUIContext, eventBus, subagentEventBus };
 	};
 }
 

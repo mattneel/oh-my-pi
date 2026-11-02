@@ -1,6 +1,6 @@
 import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, UsageReport } from "@oh-my-pi/pi-ai";
+import { applySessionModel } from "../session-model-switch";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
@@ -766,30 +766,28 @@ export class SelectorController {
 	): Promise<void> {
 		const target = this.ctx.viewSession;
 		const focusedAgentId = this.ctx.focusedAgentId;
-		const apply = async () => {
-			const level = thinkingLevel ?? target.resolveTemporaryModelThinkingLevel(model);
-			await target.setModelTemporary(model, level);
-			this.ctx.statusLine.invalidate();
-			this.ctx.updateEditorBorderColor();
-			if (focusedAgentId) {
-				this.ctx.showStatus(`Agent ${focusedAgentId} model: ${selector}`);
-				return;
-			}
-			const roleSelectorHint = appKey(this.ctx.keybindings, "app.model.select") || formatKeyHint("alt+m");
-			this.ctx.showStatus(`Session-only model: ${selector}. Use ${roleSelectorHint} or /model for roles.`);
-		};
-		if (!compactFirst || focusedAgentId) {
-			await apply();
-			return;
-		}
-		let switched = false;
-		const switchAfterCompaction = async (outcome: CompactionOutcome) => {
-			if (switched || outcome !== "ok") return;
-			switched = true;
-			await apply();
-		};
-		const outcome = await this.ctx.handleCompactCommand(undefined, undefined, switchAfterCompaction);
-		await switchAfterCompaction(outcome);
+		await applySessionModel({
+			session: target,
+			model,
+			thinkingLevel,
+			compactFirst: compactFirst && !focusedAgentId,
+			compact: async apply => {
+				const outcome = await this.ctx.handleCompactCommand(undefined, undefined, async result => {
+					if (result === "ok") await apply();
+				});
+				return outcome === "ok";
+			},
+			onApplied: () => {
+				this.ctx.statusLine.invalidate();
+				this.ctx.updateEditorBorderColor();
+				if (focusedAgentId) {
+					this.ctx.showStatus(`Agent ${focusedAgentId} model: ${selector}`);
+					return;
+				}
+				const roleSelectorHint = appKey(this.ctx.keybindings, "app.model.select") || formatKeyHint("alt+m");
+				this.ctx.showStatus(`Session-only model: ${selector}. Use ${roleSelectorHint} or /model for roles.`);
+			},
+		});
 	}
 
 	/**

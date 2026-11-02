@@ -650,7 +650,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		params: AskParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
@@ -809,7 +809,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							...(q.multi !== undefined ? { multi: q.multi } : {}),
 							...(q.recommended !== undefined ? { recommended: q.recommended } : {}),
 						})),
-						{ timeout: timeout ?? undefined, signal: dialogSignal, acceptImages: true },
+						{ timeout: timeout ?? undefined, signal: dialogSignal, acceptImages: true, toolCallId },
 					);
 				const richResult = await untilAborted(dialogSignal, showRichDialog);
 				if (!richResult) return cancelAsk();

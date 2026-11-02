@@ -1284,6 +1284,7 @@ export class SessionMaintenance {
 					markCommitted,
 				);
 				options?.onComplete?.(result);
+				await options?.beforeResume?.();
 				return finish(result);
 			}
 
@@ -1608,6 +1609,9 @@ export class SessionMaintenance {
 				...(providerReplayThroughEntryId ? { providerReplayThroughEntryId } : {}),
 			};
 			options?.onComplete?.(compactionResult);
+			// Apply a caller's post-compaction mutation before the finally block
+			// reconnects and drains prompts queued while maintenance owned the session.
+			await options?.beforeResume?.();
 			return finish(compactionResult);
 		} catch (error) {
 			manualCompactionError = error;

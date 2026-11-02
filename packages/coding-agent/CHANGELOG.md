@@ -5,6 +5,8 @@
 ### Added
 
 - ACP hosts can receive the shared native TSP transcript over an optional duplex side channel with `omp acp --tsp [fd|socket]`, independently of ACP stdio.
+- ACP cockpit hosts can negotiate per-window model/effort pickers and the Agents hub, a shared status/Stop dock, tool approvals and questions while keeping all completions on ACP.
+- ACP cockpit transcripts preserve durable assistant and Yard turn keys across reload/replay, separate explicit Yard context from visible messages, and retain complete folded tool content.
 
 ## [18.15.0] - 2026-11-01
 

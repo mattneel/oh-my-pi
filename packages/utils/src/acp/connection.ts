@@ -127,6 +127,14 @@ export class AgentSideConnection {
 	unstable_createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
 		return this.#connection.request("elicitation/create", params);
 	}
+	/** Creates an elicitation with its actual wire id and local cancellation handle. */
+	unstable_createElicitationWithCancel(params: CreateElicitationRequest): {
+		id?: number;
+		promise: Promise<CreateElicitationResponse>;
+		cancel(): void;
+	} {
+		return this.#connection.requestCancellable<CreateElicitationResponse>("elicitation/create", params);
+	}
 	/** Notifies a client that URL elicitation completed. */
 	unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void> {
 		return this.#connection.notify("elicitation/complete", params);
