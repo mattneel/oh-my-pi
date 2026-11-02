@@ -76,6 +76,7 @@ export const TSP_KINDS = [
 	"picker",
 	"prefs",
 	"tool",
+	"questions",
 	"checklist",
 	"agent",
 	"chart",
@@ -169,7 +170,7 @@ export type TspMark = "pick" | "drop";
 
 export type TspWrap = "word" | "char" | "none";
 export type TspTruncate = "end" | "start" | "middle";
-export type TspCardStatus = "pending" | "running" | "done" | "error" | "cancelled";
+export type TspCardStatus = "pending" | "running" | "done" | "error" | "cancelled" | "ask";
 export type TspPreview = { lines: number } | "auto";
 
 export interface TspColProps {
@@ -738,6 +739,17 @@ export interface TspToolProps {
 	/** Badges in the head (`you`, `background`, `new file`, `python`). */
 	badges?: readonly { text: string; tone?: TspTone; title?: string }[];
 	status: TspCardStatus;
+	/** Approval UI is declarative; the ACP host owns the answer. */
+	confirm?: "card" | "strip" | "scopes";
+	ask?: {
+		text?: string;
+		allow?: string;
+		deny?: string;
+		always?: string | false;
+		scopes?: readonly { id: string; label?: string }[];
+		scope?: string;
+	};
+	approved?: "once" | "session" | "always" | "denied";
 	/** Running: ms already elapsed when sent. Done: total duration. */
 	age?: number;
 	took?: number;
@@ -758,6 +770,27 @@ export interface TspToolProps {
 	preview?: { lines: number } | { tail: number } | "none" | "children";
 	/** Actions offered in the head on hover (`copy`, `rerun`, `open`). */
 	tools?: readonly TspPickerAction[];
+}
+
+export interface TspQuestion {
+	id: string;
+	prompt?: string;
+	description?: string;
+	choices?: readonly (string | { value: string; label?: string; detail?: string })[];
+	multi?: boolean;
+	other?: boolean | { placeholder?: string };
+	required?: boolean;
+}
+
+export interface TspQuestionsProps {
+	items: readonly TspQuestion[];
+	step?: number;
+	answers?: Readonly<Record<string, string | readonly string[]>>;
+	variant?: "steps" | "inline" | "list";
+	hint?: string;
+	submit?: string;
+	/** Resolved ACP requests remain visible without accepting more answers. */
+	readonly?: boolean;
 }
 
 /** One checklist item (§7.5). */
@@ -938,6 +971,7 @@ export interface TspPropsByKind {
 	picker: TspPickerProps;
 	prefs: TspPrefsProps;
 	tool: TspToolProps;
+	questions: TspQuestionsProps;
 	checklist: TspChecklistProps;
 	agent: TspAgentProps;
 	chart: TspChartProps;
@@ -1014,6 +1048,8 @@ export interface TspOpen {
 	title?: string;
 	role?: string;
 	adopt?: boolean;
+	/** Authenticated window audience; only with the host's `viewers` feature. */
+	viewer?: string;
 }
 
 /** Verb `x`: close a surface. */
@@ -1048,8 +1084,11 @@ export type TspReply =
 	  }
 	| { r: "blobs"; have: readonly string[] };
 
+/** Structured values carried by forms and questionnaire submissions. */
+export type TspEventValue = null | boolean | number | string | readonly string[] | Readonly<Record<string, unknown>>;
+
 /** Verb `e`: terminal → program events. */
-export type TspEvent =
+export type TspEvent = { readonly viewer?: string } & (
 	| { ev: "ack"; sf: string; s: number }
 	| { ev: "resize"; sf?: string; cols: number; cell?: { w: number; h: number }; visible?: boolean }
 	| { ev: "theme"; dark: boolean }
@@ -1058,14 +1097,24 @@ export type TspEvent =
 	| { ev: "toggle"; sf: string; id: string; key?: string; collapsed: boolean }
 	| { ev: "select"; sf: string; id: string; item: string }
 	| { ev: "activate"; sf: string; id: string; item: string }
-	| { ev: "action"; sf: string; id: string; act: string; value?: string; mods?: readonly string[] }
+	| {
+			ev: "action";
+			sf: string;
+			id: string;
+			act: string;
+			item?: string;
+			value?: string | Readonly<Record<string, TspEventValue>>;
+			values?: Readonly<Record<string, TspEventValue>>;
+			mods?: readonly string[];
+	  }
 	/** A typed value changed by pointer (prefs rows, picker toggles); `null` resets to the default. */
 	| {
 			ev: "change";
 			sf: string;
 			id: string;
 			item: string;
-			value: boolean | number | string | readonly string[] | null;
+			value: TspEventValue;
+			values?: Readonly<Record<string, TspEventValue>>;
 	  }
 	/**
 	 * An edit over the terminal's selection in an `editor`/`input` node: replace
@@ -1096,4 +1145,7 @@ export type TspEvent =
 	 */
 	| { ev: "focus"; sf: string; id: string }
 	| { ev: "error"; sf?: string; s?: number; op?: number; msg: string }
-	| { ev: "gone"; sf?: string; ids: readonly string[] };
+	| { ev: "gone"; sf?: string; ids: readonly string[] }
+	| { ev: "key"; sf: string; viewer: string; data: string }
+	| { ev: "viewer"; viewer: string; present: boolean }
+);

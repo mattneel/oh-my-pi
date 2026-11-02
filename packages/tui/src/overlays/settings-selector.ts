@@ -1008,6 +1008,7 @@ export class SettingsSelectorComponent implements Component {
 		const list = this.#searchList ?? this.#currentList;
 		switch (event.type) {
 			case "action":
+				if (event.value !== undefined && typeof event.value !== "string") return;
 				if (event.act === "page" && event.value) {
 					this.#showPage(event.value);
 				} else if (event.act === "close") {
@@ -1037,7 +1038,8 @@ export class SettingsSelectorComponent implements Component {
 				list?.openSubmenuFor(event.item);
 				return;
 			case "change":
-				if (list) this.#applyPrefsChange(list, event.item, event.value);
+				if (list && (event.value === null || typeof event.value !== "object" || Array.isArray(event.value)))
+					this.#applyPrefsChange(list, event.item, event.value);
 				return;
 			case "toggle":
 				return;

@@ -763,7 +763,11 @@ export class ExtensionDashboard implements Component {
 			return;
 		}
 		if (event.type === "action") {
-			this.#handlePick({ kind: "action", act: event.act, value: event.value });
+			this.#handlePick({
+				kind: "action",
+				act: event.act,
+				value: typeof event.value === "string" ? event.value : undefined,
+			});
 			return;
 		}
 		if (

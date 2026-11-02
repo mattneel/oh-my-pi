@@ -84,7 +84,7 @@ function prefsDetailEvent(list: SettingsList | undefined, event: NativeUiEvent):
 			list.openSubmenuFor(event.item);
 			return;
 		case "action":
-			if (event.act === "edit" && event.value) list.openSubmenuFor(event.value);
+			if (event.act === "edit" && typeof event.value === "string" && event.value) list.openSubmenuFor(event.value);
 			else if (event.act === "close" && event.value && list.openSubmenu?.id === event.value)
 				list.handleInput("\x1b");
 			return;
@@ -389,7 +389,7 @@ export class PluginListComponent extends OverlayPanel {
 	handlePrefsEvent(event: NativeUiEvent): void {
 		if (event.type === "select") this.#selectList.setSelectedValue(event.item);
 		else if (event.type === "activate") this.#selectList.handleNativeEvent(event);
-		else if (event.type === "action" && event.act === "open" && event.value) {
+		else if (event.type === "action" && event.act === "open" && typeof event.value === "string" && event.value) {
 			this.#selectList.handleNativeEvent({ type: "activate", key: event.key, item: event.value });
 		}
 	}
