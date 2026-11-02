@@ -1,6 +1,6 @@
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthPrompt } from "@oh-my-pi/pi-ai/oauth/types";
-import { Container, getKeybindings, Spacer, Text, type TUI, wrapTextWithAnsi } from "../index";
+import { Container, getKeybindings, Spacer, Text, wrapTextWithAnsi } from "../index";
 import { theme } from "../theme/theme";
 import { urlHyperlinkAlways, WidthAwareText } from "../render/index";
 import { formTheme } from "../chrome/form-theme";
@@ -58,13 +58,18 @@ function urlPlace(url: string): string {
 	}
 }
 
+/** Rendering is the only host capability needed by the OAuth dialog. */
+export interface LoginDialogHost {
+	requestRender(): void;
+}
+
 /**
  * Login dialog component - replaces editor during OAuth login flow
  */
 export class LoginDialogComponent extends OverlayPanel {
 	#contentContainer: Container;
 	#input: TextFormField;
-	#tui: Pick<TUI, "requestRender">;
+	#tui: LoginDialogHost;
 	#focused = false;
 	#useTerminalCursor = false;
 	#onComplete: (success: boolean, message?: string) => void;
@@ -80,7 +85,7 @@ export class LoginDialogComponent extends OverlayPanel {
 	#nativeRoot: NativeNode | undefined;
 
 	constructor(
-		tui: Pick<TUI, "requestRender">,
+		tui: LoginDialogHost,
 		providerId: string,
 		onComplete: (success: boolean, message?: string) => void,
 		openUrl: (url: string) => void,
@@ -148,11 +153,20 @@ export class LoginDialogComponent extends OverlayPanel {
 		return this.#abortController.signal;
 	}
 
-	#cancel(): void {
+	/** Abort an abandoned host's OAuth flow and reject any pending input. */
+	override dispose(): void {
+		if (this.signal.aborted) return;
 		this.#abortController.abort();
 		const reject = this.#inputRejecter;
 		this.#clearInputHandlers();
-		reject?.(new Error("Login cancelled"));
+		reject?.(new Error("Login dialog closed"));
+		this.#input.focused = false;
+		super.dispose();
+	}
+
+	#cancel(): void {
+		if (this.signal.aborted) return;
+		this.dispose();
 		this.#onComplete(false, "Login cancelled");
 	}
 
@@ -168,6 +182,7 @@ export class LoginDialogComponent extends OverlayPanel {
 	 * link to the full URL, so clicking any wrapped fragment opens the same target.
 	 */
 	showAuth(url: string, instructions?: string, launchUrl?: string): void {
+		if (this.signal.aborted) return;
 		this.#contentContainer.clear();
 		this.#contentContainer.addChild(new Spacer(1));
 		this.#contentContainer.addChild(
@@ -217,6 +232,7 @@ export class LoginDialogComponent extends OverlayPanel {
 	 * Show input for manual code/URL entry (for callback server providers)
 	 */
 	showManualInput(prompt: string, signal?: AbortSignal): Promise<string> {
+		if (this.signal.aborted) return Promise.reject(new Error("Login dialog closed"));
 		// Keep retry chrome in place, but discard prior prompt undo/kill history.
 		const mounted = this.#contentContainer.children.indexOf(this.#input);
 		const previousInput = this.#input;
@@ -262,6 +278,7 @@ export class LoginDialogComponent extends OverlayPanel {
 	 * Note: Does NOT clear content, appends to existing (preserves URL from showAuth)
 	 */
 	showPrompt(prompt: OAuthPrompt): Promise<string> {
+		if (this.signal.aborted) return Promise.reject(new Error("Login dialog closed"));
 		// Multi-step flows keep prior answers visible, except secrets.
 		const mounted = this.#contentContainer.children.indexOf(this.#input);
 		if (mounted !== -1) {
@@ -315,6 +332,7 @@ export class LoginDialogComponent extends OverlayPanel {
 	 * Show waiting message (for polling flows like GitHub Copilot)
 	 */
 	showWaiting(message: string): void {
+		if (this.signal.aborted) return;
 		this.#contentContainer.addChild(new Spacer(1));
 		this.#contentContainer.addChild(new Text(theme.fg("dim", message), 0, 0));
 		this.#contentContainer.addChild(new Text(theme.fg("dim", `(${editorKey("tui.select.cancel")} to cancel)`), 0, 0));
@@ -327,6 +345,7 @@ export class LoginDialogComponent extends OverlayPanel {
 	 * Called by onProgress callback
 	 */
 	showProgress(message: string): void {
+		if (this.signal.aborted) return;
 		this.#contentContainer.addChild(new Text(theme.fg("dim", message), 0, 0));
 		this.#nativeSteps.push({ kind: "progress", message: plainText(message) });
 		this.#nativeRoot = undefined;
@@ -521,7 +540,7 @@ export class LoginDialogComponent extends OverlayPanel {
 	/** Cancel and Continue run what Esc and Enter run. */
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (event.type !== "action") return;
-		if (event.act === "cancel") this.#cancel();
+		if (event.act === "cancel" || event.act === "close") this.#cancel();
 		else if (event.act === "submit") this.#activeField()?.submit();
 	}
 

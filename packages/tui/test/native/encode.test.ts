@@ -69,6 +69,70 @@ describe("TSP framing", () => {
 		});
 	});
 
+	it("decodes command context and opaque correlation across chunks without requiring a surface", () => {
+		const reader = new TspReader();
+		const full = {
+			ev: "command" as const,
+			name: "models",
+			args: "role €漢字🙂",
+			viewer: "window-a",
+			sf: "v.window-a.2",
+			id: "opaque:/🙂",
+			future: true,
+		};
+		const decoded = messages(encodeTspMessage("e", JSON.stringify(full), undefined, 9)).map(message =>
+			reader.feed(message),
+		);
+		expect(decoded.at(-1)).toEqual({ verb: "e", event: full });
+		for (const sf of [undefined, ""]) {
+			const event = { ev: "command", name: "status", args: "", viewer: "window-a", sf, id: "" };
+			expect(parseTspMessage(encodeTspMessage("e", JSON.stringify(event)))).toEqual({
+				verb: "e",
+				event: JSON.parse(JSON.stringify(event)),
+			});
+		}
+	});
+
+	it("rejects command events with missing required fields or malformed optional context", () => {
+		const valid = { ev: "command", name: "models", args: "", viewer: "window-a" };
+		for (const event of [
+			{ ...valid, name: undefined },
+			{ ...valid, name: 1 },
+			{ ...valid, args: undefined },
+			{ ...valid, args: [] },
+			{ ...valid, viewer: undefined },
+			{ ...valid, viewer: "" },
+			{ ...valid, viewer: 1 },
+			{ ...valid, sf: null },
+			{ ...valid, sf: 1 },
+			{ ...valid, id: null },
+			{ ...valid, id: 1 },
+		]) {
+			expect(parseTspMessage(encodeTspMessage("e", JSON.stringify(event)))).toBeNull();
+		}
+	});
+
+	it("decodes discriminated command replies and rejects incomplete outcomes", () => {
+		const base = { r: "command" as const, name: "models", viewer: "window-a", id: "" };
+		for (const reply of [
+			{ ...base, ok: true as const, sf: "v.window-a.2" },
+			{ ...base, ok: false as const, error: 'Command "models" refused' },
+		]) {
+			expect(parseTspMessage(encodeTspMessage("r", JSON.stringify(reply)))).toEqual({ verb: "r", reply });
+		}
+		for (const reply of [
+			{ ...base, ok: true },
+			{ ...base, ok: true, sf: "" },
+			{ ...base, ok: false },
+			{ ...base, ok: false, error: 1 },
+			{ ...base, ok: "true", sf: "v.window-a.2" },
+			{ ...base, ok: true, sf: "v.window-a.2", viewer: "" },
+			{ ...base, ok: true, sf: "v.window-a.2", id: 1 },
+		]) {
+			expect(parseTspMessage(encodeTspMessage("r", JSON.stringify(reply)))).toBeNull();
+		}
+	});
+
 	it("chunks a body over the APC limit and reassembles it byte-exact, never splitting a code point", () => {
 		const body = JSON.stringify({ text: 'ab€漢字🙂🙃 é\u001b"quote" '.repeat(9) });
 		const limit = 23;

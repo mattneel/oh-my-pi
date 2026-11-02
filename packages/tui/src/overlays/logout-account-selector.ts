@@ -10,7 +10,7 @@ import { node, span } from "../native/describe";
 import type { DescribeContext, NativeNode, NativeUiEvent } from "../native/node";
 import { CLOSE_ACTION, dockedPicker, PICKER_KEY, pickerAction, pickerEvent } from "../native/picker";
 import type { TspPickerItem } from "@oh-my-pi/pi-wire";
-import { actionHint, hintsRow, overlayCard } from "../native/overlay";
+import { actionBar, actionButton, actionHint, hintsRow, overlayCard } from "../native/overlay";
 
 const LOGOUT_SELECTOR_MAX_VISIBLE = 10;
 
@@ -195,12 +195,17 @@ export class LogoutAccountSelectorComponent extends OverlayPanel {
 				{ keys: ["enter"], label: "log out account" },
 				actionHint("tui.select.cancel", "cancel"),
 			])),
+			actionBar([null, actionButton("Close", "close", { keys: "escape" })]),
 		]);
 		return this.#nativeRoot;
 	}
 
 	/** A click (or double-click) on an account highlights it and logs it out, like Enter. */
 	handleNativeEvent(event: NativeUiEvent): void {
+		if (event.type === "action" && (event.act === "close" || event.act === "cancel")) {
+			this.#onCancelCallback();
+			return;
+		}
 		const ev = pickerEvent(event, PICKER_KEY);
 		if (ev?.kind === "action") {
 			if (ev.act === "confirm") this.#confirmSelection();

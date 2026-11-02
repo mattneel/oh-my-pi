@@ -1064,6 +1064,26 @@ export type TspQuery =
 	| { q: "hello"; v: readonly number[]; app: string; ver?: string; features?: readonly string[] }
 	| { q: "blobs"; ids: readonly string[] };
 
+/** A window-local screen command, available only with the host's `viewers` feature. */
+export interface TspCommandEvent {
+	ev: "command";
+	name: string;
+	args: string;
+	viewer: string;
+	/** Omitted or empty selects the active shared document; otherwise names an existing document. */
+	sf?: string;
+	/** Opaque correlation id, returned unchanged in the reply. */
+	id?: string;
+}
+
+/** Program → host acknowledgement of a window-local screen command. */
+export type TspCommandReply = {
+	r: "command";
+	name: string;
+	viewer: string;
+	id?: string;
+} & ({ ok: true; sf: string } | { ok: false; error: string });
+
 /** Verb `r`. */
 export type TspReply =
 	| {
@@ -1082,7 +1102,8 @@ export type TspReply =
 			/** The user's system reads a 12-hour clock (`false`: 24-hour); absent from older terminals. */
 			hour12?: boolean;
 	  }
-	| { r: "blobs"; have: readonly string[] };
+	| { r: "blobs"; have: readonly string[] }
+	| TspCommandReply;
 
 /** Structured values carried by forms and questionnaire submissions. */
 export type TspEventValue = null | boolean | number | string | readonly string[] | Readonly<Record<string, unknown>>;
@@ -1148,4 +1169,5 @@ export type TspEvent = { readonly viewer?: string } & (
 	| { ev: "gone"; sf?: string; ids: readonly string[] }
 	| { ev: "key"; sf: string; viewer: string; data: string }
 	| { ev: "viewer"; viewer: string; present: boolean }
+	| TspCommandEvent
 );

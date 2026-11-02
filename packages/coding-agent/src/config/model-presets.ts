@@ -322,9 +322,11 @@ export async function applyModelPreset(
 	settings: Settings,
 	session: ModelPresetSession,
 	name: string,
+	isCurrent?: () => boolean,
 ): Promise<ModelPresetSwitchResult> {
 	const release = await acquireModelRoleMutation();
 	try {
+		if (isCurrent?.() === false) return { kind: "unavailable", reason: "Models screen is closed" };
 		return await applyModelPresetLocked(settings, session, name);
 	} finally {
 		release();

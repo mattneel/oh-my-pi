@@ -192,6 +192,18 @@ function decodeReply(value: Record<string, unknown>): TspReply | null {
 		return value as TspHello;
 	}
 	if (value.r === "blobs") return isStringArray(value.have) ? (value as TspReply) : null;
+	if (value.r === "command") {
+		if (
+			typeof value.name !== "string" ||
+			typeof value.viewer !== "string" ||
+			!value.viewer ||
+			(value.id !== undefined && typeof value.id !== "string")
+		)
+			return null;
+		if (value.ok === true) return typeof value.sf === "string" && value.sf ? (value as TspReply) : null;
+		if (value.ok === false) return typeof value.error === "string" ? (value as TspReply) : null;
+		return null;
+	}
 	return null;
 }
 
@@ -219,6 +231,17 @@ const EVENT_REQUIRED: Readonly<Record<string, Readonly<Record<string, "string" |
 function decodeEvent(value: Record<string, unknown>): TspEvent | null {
 	if (typeof value.ev !== "string") return null;
 	if (value.viewer !== undefined && (typeof value.viewer !== "string" || !value.viewer)) return null;
+	if (value.ev === "command") {
+		if (
+			typeof value.name !== "string" ||
+			typeof value.args !== "string" ||
+			typeof value.viewer !== "string" ||
+			(value.sf !== undefined && typeof value.sf !== "string") ||
+			(value.id !== undefined && typeof value.id !== "string")
+		)
+			return null;
+		return value as TspEvent;
+	}
 	if (value.ev === "send") {
 		const { sf, id, text } = value;
 		if (typeof sf !== "string" || !sf || typeof id !== "string" || !id || typeof text !== "string") return null;

@@ -42,6 +42,7 @@
 - Added negotiated viewer-scoped native surfaces and key routing, tool approval projections and question forms for ACP cockpits.
 - Transcript builders can opt into durable wire keys, explicit Yard context sections and complete tool bodies independent of local folds.
 - The Git app accepts a portable rendering/lifetime host, allowing viewer-scoped native pages without constructing an interactive terminal.
+- Native viewer command events have correlated success/refusal replies; full Models, settings, agents and auth screens accept narrow hosts with viewer-owned cancellation.
 
 ### Fixed
 

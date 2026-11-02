@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildAvailableSlashCommands } from "@oh-my-pi/pi-coding-agent/slash-commands/available-commands";
+import {
+	buildAvailableSlashCommands,
+	toAcpAvailableCommands,
+} from "@oh-my-pi/pi-coding-agent/slash-commands/available-commands";
+import { ACP_SCREEN_COMMAND_NAMES } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-screen-commands";
 
 describe("buildAvailableSlashCommands", () => {
 	test("returns RPC-safe command metadata with stable sources", async () => {
@@ -172,5 +176,55 @@ describe("buildAvailableSlashCommands", () => {
 		expect(byName.models).toBeUndefined();
 		expect(byName.plugins.source).toBe("builtin");
 		expect(byName.plugins.aliases).toEqual(["plugin"]);
+	});
+
+	test("advertises actual viewer screen commands and aliases only after negotiation", async () => {
+		const session = {
+			customCommands: [],
+			skills: [],
+			sessionManager: { getCwd: () => process.cwd() },
+			setSlashCommands() {},
+		};
+		const legacy = toAcpAvailableCommands(await buildAvailableSlashCommands(session, async () => []));
+		expect(legacy.some(command => command._meta?.["omp/screen"])).toBe(false);
+		expect(legacy.some(command => command.name === "agents")).toBe(false);
+		const commands = toAcpAvailableCommands(
+			await buildAvailableSlashCommands(session, async () => [], { screenCommands: ACP_SCREEN_COMMAND_NAMES }),
+		);
+		expect(
+			commands
+				.filter(command => command._meta?.["omp/screen"])
+				.map(command => command.name)
+				.sort(),
+		).toEqual([...ACP_SCREEN_COMMAND_NAMES].sort());
+		for (const name of [
+			"model",
+			"models",
+			"context",
+			"usage",
+			"agents",
+			"git",
+			"hub",
+			"subagents",
+			"settings",
+			"login",
+		]) {
+			expect(commands.find(command => command.name === name)?._meta).toEqual({ "omp/screen": true });
+		}
+		for (const name of [
+			"resume",
+			"branch",
+			"tree",
+			"move",
+			"seance",
+			"pause",
+			"plan-review",
+			"live",
+			"local",
+			"setup",
+			"extensions",
+		]) {
+			expect(commands.find(command => command.name === name)?._meta?.["omp/screen"]).toBeUndefined();
+		}
 	});
 });

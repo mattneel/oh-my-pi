@@ -139,8 +139,10 @@ export function createAgentsHubDeps(
 				cfgTaskAgentModelOverrides.override(settings, { ...persisted, ...Object.fromEntries(sessionPicks) });
 			}
 		},
-		generateAgent: async (description, onText) => {
+		generateAgent: async (description, onText, signal) => {
+			signal?.throwIfAborted();
 			await modelRegistry.refresh();
+			signal?.throwIfAborted();
 			const patterns = resolveConfiguredModelPatterns(
 				activeModelPattern ?? defaultModelPattern ?? settings.getModelRole("default"),
 				settings,
@@ -168,6 +170,14 @@ export function createAgentsHubDeps(
 				// A helper for the host session: the host keeps the process-wide effects and provider toggles.
 				bindProcessState: false,
 			});
+			if (signal?.aborted) {
+				await session.dispose();
+				signal.throwIfAborted();
+			}
+			const abort = () => {
+				void session.abort().catch(() => {});
+			};
+			signal?.addEventListener("abort", abort, { once: true });
 			const unsubscribe = session.subscribe(event => {
 				if (event.type === "message_update" && "assistantMessageEvent" in event) {
 					const ame = event.assistantMessageEvent;
@@ -175,14 +185,17 @@ export function createAgentsHubDeps(
 				}
 			});
 			try {
+				signal?.throwIfAborted();
 				await session.prompt(prompt.render(agentCreationUserPrompt, { request: description }), {
 					expandPromptTemplates: false,
 				});
+				signal?.throwIfAborted();
 				const raw = extractAssistantText(session.state.messages);
 				if (!raw) throw new Error("No response returned by agent creation architect.");
 				return raw;
 			} finally {
 				unsubscribe();
+				signal?.removeEventListener("abort", abort);
 				await session.dispose();
 			}
 		},

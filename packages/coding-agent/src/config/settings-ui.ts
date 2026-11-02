@@ -20,30 +20,32 @@ import { cfgContextFilesExtra } from "../session/context-settings";
 import { cfgTaskPerCallModelAllow } from "../task/settings";
 import { cfgToolsRestrictedFolders } from "../tools/settings";
 
-/** Condition over the global settings; hidden (false) until they are initialized. */
-function whenSettings(test: (settings: Settings) => boolean): () => boolean {
-	return () => isSettingsInitialized() && test(Settings.instance);
+/** Conditions follow the same settings store as the values being edited. */
+function createConditions(source: Settings): Record<string, () => boolean> {
+	const whenSettings =
+		(test: (settings: Settings) => boolean): (() => boolean) =>
+		() =>
+			(source !== settings || isSettingsInitialized()) && test(source);
+	return {
+		macOS: () => process.platform === "darwin",
+		hasImageProtocol: () => !!TERMINAL.imageProtocol,
+		nativeRendering: () => isNativeRendering(),
+		advisorEnabled: whenSettings(s => cfgAdvisorEnabled.get(s) === true),
+		vimModeEnabled: whenSettings(s => cfgTuiVimMode.get(s) === true),
+		composerPredictionsEnabled: whenSettings(s => cfgComposerPredictions.get(s) === true),
+		hindsightActive: whenSettings(s => cfgMemoryBackend.get(s) === "hindsight"),
+		mnemopiActive: whenSettings(s => cfgMemoryBackend.get(s) === "mnemopi"),
+		autolearnActive: whenSettings(s => cfgAutolearnEnabled.get(s) === true),
+		autoThinkingActive: whenSettings(s => cfgDefaultThinkingLevel.get(s) === "auto"),
+		usageAwareFallbackEnabled: whenSettings(s => cfgRetryUsageAwareFallback.get(s) === true),
+		planModeEnabled: whenSettings(s => cfgPlanEnabled.get(s)),
+		planAutosaveEnabled: whenSettings(s => cfgPlanEnabled.get(s) && cfgPlanAutosave.get(s)),
+		// These editors write the global layer; never promote a project-supplied list.
+		contextFilesExtraNotProject: whenSettings(s => cfgContextFilesExtra.provenance(s) !== "project"),
+		restrictedFoldersNotProject: whenSettings(s => cfgToolsRestrictedFolders.provenance(s) !== "project"),
+		perCallModelAllowNotProject: whenSettings(s => cfgTaskPerCallModelAllow.provenance(s) !== "project"),
+	};
 }
-
-const CONDITIONS: Record<string, () => boolean> = {
-	macOS: () => process.platform === "darwin",
-	hasImageProtocol: () => !!TERMINAL.imageProtocol,
-	nativeRendering: () => isNativeRendering(),
-	advisorEnabled: whenSettings(s => cfgAdvisorEnabled.get(s) === true),
-	vimModeEnabled: whenSettings(s => cfgTuiVimMode.get(s) === true),
-	composerPredictionsEnabled: whenSettings(s => cfgComposerPredictions.get(s) === true),
-	hindsightActive: whenSettings(s => cfgMemoryBackend.get(s) === "hindsight"),
-	mnemopiActive: whenSettings(s => cfgMemoryBackend.get(s) === "mnemopi"),
-	autolearnActive: whenSettings(s => cfgAutolearnEnabled.get(s) === true),
-	autoThinkingActive: whenSettings(s => cfgDefaultThinkingLevel.get(s) === "auto"),
-	usageAwareFallbackEnabled: whenSettings(s => cfgRetryUsageAwareFallback.get(s) === true),
-	planModeEnabled: whenSettings(s => cfgPlanEnabled.get(s)),
-	planAutosaveEnabled: whenSettings(s => cfgPlanEnabled.get(s) && cfgPlanAutosave.get(s)),
-	// These editors write the global layer; hide them so a project-supplied list is never promoted to global.
-	contextFilesExtraNotProject: whenSettings(s => cfgContextFilesExtra.provenance(s) !== "project"),
-	restrictedFoldersNotProject: whenSettings(s => cfgToolsRestrictedFolders.provenance(s) !== "project"),
-	perCallModelAllowNotProject: whenSettings(s => cfgTaskPerCallModelAllow.provenance(s) !== "project"),
-};
 
 /** Description suffix telling the panel user that an environment variable is in play. */
 function envNote(setting: AnySetting): string {
@@ -58,7 +60,8 @@ function envNote(setting: AnySetting): string {
  * edits the value of the settings layers, never an environment-supplied one (so an env credential
  * is never pre-filled or written to config); descriptions note an active environment variable.
  */
-export function createSettingsHost(): SettingsHost {
+export function createSettingsHost(source: Settings = settings): SettingsHost {
+	const conditions = createConditions(source);
 	const entries: SettingsDisplayEntry[] = [];
 	for (const tab of SETTING_TABS) {
 		for (const setting of orderedSettings()) {
@@ -72,7 +75,7 @@ export function createSettingsHost(): SettingsHost {
 				ui: note ? { ...ui, description: `${ui.description}${note}` } : ui,
 				enumValues: setting.enumValues,
 				credential: setting.isCredential,
-				condition: ui.condition ? CONDITIONS[ui.condition] : undefined,
+				condition: ui.condition ? conditions[ui.condition] : undefined,
 			});
 		}
 	}
@@ -83,9 +86,9 @@ export function createSettingsHost(): SettingsHost {
 	};
 	return {
 		entries,
-		get: path => lookup(path)?.layered(settings),
-		set: (path, value) => resolve(path).set(settings, value),
-		unset: path => resolve(path).unset(settings),
+		get: path => lookup(path)?.layered(source),
+		set: (path, value) => resolve(path).set(source, value),
+		unset: path => resolve(path).unset(source),
 		normalizeProviderLimits: normalizeProviderMaxInFlightRequests,
 		validateProviderLimits: validateProviderMaxInFlightRequests,
 	};

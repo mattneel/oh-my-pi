@@ -249,6 +249,9 @@ export function leafKey(path: string): string {
 /** Terminal-level events the backend doesn't route to a single component. */
 export type NativeTerminalEvent = Extract<TspEvent, { ev: "theme" | "motion" | "visible" | "resize" }>;
 
+/** A viewer command handled by the host, never by a node-owned component. */
+export type NativeCommandEvent = Extract<TspEvent, { ev: "command" }>;
+
 /** Implemented by components that react to user actions on their described nodes. */
 export interface NativeEventTarget {
 	handleNativeEvent(event: NativeUiEvent): void;

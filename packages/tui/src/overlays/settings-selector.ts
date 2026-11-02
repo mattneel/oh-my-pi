@@ -606,6 +606,8 @@ export interface SettingsCallbacks {
 	onPluginsChanged?: () => void | Promise<void>;
 	/** Called when settings panel is closed */
 	onCancel: () => void;
+	/** Releases host-owned preview resources when the mounted root is disposed. */
+	onDispose?: () => void;
 }
 
 /**
@@ -613,6 +615,7 @@ export interface SettingsCallbacks {
  * Uses declarative settings definitions from settings-defs.ts.
  */
 export class SettingsSelectorComponent implements Component {
+	#disposed = false;
 	#tabBar: TabBar;
 	/** The tab bar's current tab list (the bar keeps no public getter). */
 	#tabs: Tab[];
@@ -673,6 +676,13 @@ export class SettingsSelectorComponent implements Component {
 		this.#switchToTab("appearance");
 	}
 
+	dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#pluginComponent?.dispose();
+		this.#callbacks.onDispose?.();
+	}
+
 	invalidate(): void {
 		this.#tabBar.invalidate();
 		this.#currentList?.invalidate();
@@ -682,6 +692,7 @@ export class SettingsSelectorComponent implements Component {
 
 	/** Swap the active content (per-tab list, search list, or plugins). */
 	#setContent(build: () => void): void {
+		this.#pluginComponent?.dispose();
 		this.#currentList = null;
 		this.#searchList = null;
 		this.#pluginComponent = null;
@@ -1214,6 +1225,7 @@ export class SettingsSelectorComponent implements Component {
 	 * jump, while searching), unless an open submenu owns the pointer.
 	 */
 	handleNativeEvent(event: NativeUiEvent): void {
+		if (this.#disposed) return;
 		if (event.key === "") {
 			this.#handlePrefsEvent(event);
 			return;
@@ -1913,6 +1925,7 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	handleInput(data: string): void {
+		if (this.#disposed) return;
 		// SGR mouse reports (the fullscreen overlay enables tracking).
 		if (data.startsWith("\x1b[<")) {
 			this.#handleMouse(data);

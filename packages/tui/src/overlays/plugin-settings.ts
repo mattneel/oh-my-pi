@@ -861,6 +861,7 @@ interface InputHandler {
  * Manages navigation between plugin list and plugin detail views.
  */
 export class PluginSettingsComponent extends Container {
+	#disposed = false;
 	readonly #host: PluginSettingsHost;
 	#manager: PluginSettingsManager;
 	#viewComponent: (Component & InputHandler) | null = null;
@@ -879,6 +880,14 @@ export class PluginSettingsComponent extends Container {
 		this.#host = host;
 		this.#manager = host.manager;
 		this.#showPluginList();
+	}
+
+	override dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		super.dispose();
+		this.#viewComponent = null;
+		this.clear();
 	}
 
 	async #showPluginList(): Promise<void> {
@@ -909,6 +918,7 @@ export class PluginSettingsComponent extends Container {
 					return [];
 				}),
 		]);
+		if (this.#disposed) return;
 
 		const entries: PluginListEntry[] = [
 			...npmPlugins.map((plugin): PluginListEntry => ({ kind: "npm", plugin })),
@@ -945,6 +955,7 @@ export class PluginSettingsComponent extends Container {
 
 	/** Routes a native page event to the current view. */
 	handlePrefsEvent(event: NativeUiEvent): void {
+		if (this.#disposed) return;
 		const view = this.#viewComponent;
 		if (
 			view instanceof PluginListComponent ||
@@ -1021,6 +1032,7 @@ export class PluginSettingsComponent extends Container {
 	}
 
 	handleInput(data: string): void {
+		if (this.#disposed) return;
 		if (!this.#viewComponent) {
 			// The list view mounts asynchronously (npm + marketplace listing).
 			// Until it does — or if listing rejected and no view ever mounted —

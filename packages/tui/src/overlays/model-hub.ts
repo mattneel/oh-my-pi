@@ -18,6 +18,7 @@ import type {
 	TspPickerItem,
 	TspPickerProps,
 	TspPickerScope,
+	TspProps,
 	TspSpan,
 } from "@oh-my-pi/pi-wire";
 import type { KeysApi, Model } from "@oh-my-pi/pi-ai";
@@ -25,7 +26,7 @@ import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
 import { MODEL_KINDS, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
-import type { Component, TUI } from "../tui";
+import type { Component } from "../tui";
 import { extractPrintableText, matchesKey } from "../keys";
 import { FuzzyCorpus } from "../fuzzy";
 import { formatKeyHint, formatKeyHints } from "../app-keybindings";
@@ -100,6 +101,12 @@ type AssignTarget =
 	| { kind: "role"; role: string }
 	| { kind: "fallback"; role: string; index: number | null }
 	| { kind: "fallbackKey" };
+
+/** Rendering capabilities shared by terminal overlays and window-local native viewers. */
+export interface ModelHubHost {
+	requestRender(): void;
+	readonly terminal?: { readonly columns?: number; readonly rows?: number };
+}
 
 /** Live preferences and selector operations supplied by the host. */
 export interface ModelHubSource extends ModelBrowserSource {
@@ -390,7 +397,7 @@ export function resetProviderAutoRefreshGuard(): void {
  * the host must call {@link ModelHubComponent.dispose} when the overlay closes.
  */
 export class ModelHubComponent implements Component {
-	#tui: TUI;
+	#tui: ModelHubHost;
 	#settings: ModelHubSource;
 	#registry: ModelHubRegistry;
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
@@ -508,7 +515,7 @@ export class ModelHubComponent implements Component {
 		| undefined;
 
 	constructor(
-		tui: TUI,
+		tui: ModelHubHost,
 		settings: ModelHubSource,
 		registry: ModelHubRegistry,
 		scopedModels: ReadonlyArray<ScopedModelItem>,
@@ -3291,7 +3298,8 @@ export class ModelHubComponent implements Component {
 		const rolesView = entry.kind === "roles" && this.#assigning === null;
 		const lockedView = entry.kind === "provider" && entry.locked === true && this.#assigning === null;
 		const strip = this.#strip;
-		const props: TspPickerProps = {
+		const props: TspProps<"picker"> = {
+			role: "omp.overlay.model-hub",
 			title: "Models",
 			subtitle: this.#pickerSubtitle(entry, rolesView),
 			icon: "cpu",
