@@ -1216,6 +1216,7 @@ describe.skipIf(process.platform === "win32")("ACP TSP side channel", () => {
 		await $`git add status-overlay.txt`.env(gitEnv).cwd(cwd).quiet();
 		await $`git -c commit.gpgsign=false commit -m "Status overlay fixture"`.env(gitEnv).cwd(cwd).quiet();
 		await Bun.write(path.join(cwd, "status-overlay.txt"), "Viewer-local git change\n");
+		await Bun.write(path.join(cwd, "untracked-overlay.txt"), "Untracked dock count fixture\n");
 		const socketPath = path.join(path.dirname(cwd), "status-overlays.sock");
 		const listener = await listen(socketPath);
 		// The ACP session's repository must not depend on the server process's cwd.
@@ -1240,6 +1241,21 @@ describe.skipIf(process.platform === "win32")("ACP TSP side channel", () => {
 		host.event({ ev: "key", sf: other, viewer: "window-b", data: "transcript" });
 		const otherPicker = await host.waitForNode(node => node.k === "picker" && node.p?.query === "transcript", other);
 		const otherOpenCount = viewerOpens(host, "window-b").length;
+		const gitFact = await host.waitForNode(
+			node =>
+				node.k === "seg" &&
+				node.p?.actions?.click === "status.git" &&
+				wireText(node.p.spans).includes("acp-status") &&
+				wireText(node.p.spans).includes("*1") &&
+				/\?\d+/.test(wireText(node.p.spans)),
+			shared,
+		);
+		expect(gitFact.p?.role).toBe("omp.composer.fact");
+		expect(gitFact.p?.actions?.click).toBe("status.git");
+		if (gitFact.k !== "seg") throw new Error("The git workspace dock omitted its native segment");
+		expect(wireText(gitFact.p?.spans)).toContain("acp-status");
+		expect(wireText(gitFact.p?.spans)).toContain("*1");
+		expect(wireText(gitFact.p?.spans)).toMatch(/\?\d+/);
 		const sharedOpenCount = host.log.filter(
 			message => message.verb === "o" && isRecord(message.body) && message.body.id === shared,
 		).length;
