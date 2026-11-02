@@ -8,9 +8,11 @@
  */
 import { describe, expect, it } from "bun:test";
 import { stripTerminalSequences } from "@oh-my-pi/pi-tui/utils";
-import { gitFooterHints } from "../src/apps/git/git-tui";
+import { type GitOverlayHost, type GitTuiHost, gitFooterHints, showGitOverlay } from "../src/apps/git/git-tui";
 import { Sidebar } from "../src/apps/git/sidebar";
-import type { ChangedFile, GitViewState, HeadCommit } from "../src/apps/git/state";
+import type { ChangedFile, GitTuiModel, GitViewState, HeadCommit } from "../src/apps/git/state";
+import { ImageBudget } from "../src/components/image";
+import type { Component } from "../src/tui";
 import { initTheme } from "../src/theme/theme";
 
 const file = (path: string, area: ChangedFile["area"], additions = 1, deletions = 0): ChangedFile => ({
@@ -117,4 +119,72 @@ describe("git commit view wording", () => {
 		expect(out).toContain("2 file changes on");
 		expect(out).not.toContain("Working tree clean");
 	});
+});
+
+it("disposes a portable Git host during its initial refresh without loading stale details", async () => {
+	await initTheme();
+	const refreshed = Promise.withResolvers<boolean>();
+	const lifetime = new AbortController();
+	let detailLoads = 0;
+	let mounts = 0;
+	let hides = 0;
+	let renders = 0;
+	let focused: Component | null = null;
+	const unexpected = (): never => {
+		throw new Error("Unexpected repository operation in Git host disposal test");
+	};
+	const model: GitTuiModel = {
+		...state(),
+		refresh: () => refreshed.promise,
+		loadChangeStats: async () => {
+			detailLoads++;
+			return false;
+		},
+		loadHeadFiles: unexpected,
+		streamContents: unexpected,
+		stage: unexpected,
+		unstage: unexpected,
+		discard: unexpected,
+		commit: unexpected,
+		applyPatch: unexpected,
+	};
+	const ui: GitOverlayHost = {
+		imageBudget: new ImageBudget(0, () => {}),
+		terminal: { columns: 100 },
+		signal: lifetime.signal,
+		requestRender: () => {
+			renders++;
+		},
+		setFocus: component => {
+			focused = component;
+		},
+		showOverlay: () => {
+			mounts++;
+			return {
+				hide: () => {
+					hides++;
+				},
+				setHidden: () => {},
+				isHidden: () => false,
+			};
+		},
+	};
+	const host: GitTuiHost = {
+		model,
+		createAvatarSource: () => ({ get: () => null }),
+		aiStage: unexpected,
+		generateCommitMessage: unexpected,
+	};
+	const closed = showGitOverlay(ui, host);
+	expect(mounts).toBe(1);
+	expect(focused).not.toBeNull();
+	const rendered = renders;
+	lifetime.abort();
+	refreshed.resolve(true);
+	await closed;
+	expect(detailLoads).toBe(0);
+	expect(renders).toBe(rendered);
+	expect(hides).toBe(1);
+	await showGitOverlay(ui, host);
+	expect(mounts).toBe(1);
 });

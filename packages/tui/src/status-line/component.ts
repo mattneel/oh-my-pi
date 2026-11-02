@@ -850,8 +850,12 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		);
 	}
 
+	#getProjectDir(): string {
+		return this.host.getProjectDir?.(this.session) ?? getProjectDir();
+	}
+
 	#resolveActiveRepoCache(): ActiveRepoCache {
-		const projectDir = getProjectDir();
+		const projectDir = this.#getProjectDir();
 		if (this.#activeRepoCache?.projectDir === projectDir) {
 			return this.#activeRepoCache;
 		}
@@ -2569,7 +2573,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		}
 
 		const shouldResolveActiveRepo = this.#gitEnabled() && (includePath || includeGit || includePr);
-		const projectDir = getProjectDir();
+		const projectDir = this.#getProjectDir();
 		const activeRepoCache = shouldResolveActiveRepo
 			? this.#resolveActiveRepoCache()
 			: {
@@ -2746,7 +2750,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		const skills = this.session.skills;
 		target.themeRef = theme;
 		target.themeEpoch = getThemeEpoch();
-		target.projectDir = getProjectDir();
+		target.projectDir = this.#getProjectDir();
 		target.sessionRef = this.session;
 		target.sessionFile = this.session.sessionFile;
 		target.sessionSettingsRef = this.host.getSessionSettingsIdentity(this.session);

@@ -1,6 +1,6 @@
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import type { TUI } from "@oh-my-pi/pi-tui";
 import {
+	type GitOverlayHost,
 	type GitTuiHost,
 	runGitTui as runView,
 	showGitOverlay as showOverlay,
@@ -36,8 +36,9 @@ async function createHost(options: GitTuiOptions): Promise<GitTuiHost> {
 }
 
 /** Open repository review on an existing interactive session. */
-export async function showGitOverlay(ui: TUI, options: GitTuiOptions = {}): Promise<void> {
-	await showOverlay(ui, await createHost(options));
+export async function showGitOverlay(ui: GitOverlayHost, options: GitTuiOptions = {}): Promise<void> {
+	const host = await createHost(options);
+	if (!ui.signal?.aborted) await showOverlay(ui, host);
 }
 
 /** Run standalone repository review with application-owned capabilities. */

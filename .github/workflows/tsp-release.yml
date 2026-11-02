@@ -72,12 +72,15 @@ jobs:
               packages/coding-agent/test/acp-tsp.test.ts
               packages/coding-agent/test/acp-tsp-presentation.test.ts
               packages/coding-agent/test/acp-agent.test.ts
+              packages/coding-agent/test/acp-cockpit.test.ts
+              packages/coding-agent/test/acp-status-overlays.test.ts
               packages/utils/test/acp.test.ts
               packages/coding-agent/test/cli-tsp-flag.test.ts
               packages/coding-agent/test/cli-non-tty-launch.test.ts
               packages/tui/test/native/encode.test.ts
               packages/tui/test/native/transcript-native.test.ts
               packages/tui/test/native/transport.test.ts
+              packages/tui/test/git-commit-view-hints.test.ts
          - name: Build the release binary
            env:
               RELEASE_TARGETS: linux-x64

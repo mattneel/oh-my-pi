@@ -88,6 +88,8 @@ export interface FooterSession {
  */
 export interface StatusLineHost<TSession extends StatusLineSession = StatusLineSession> {
 	getSettings(): StatusLineSettings;
+	/** ACP sessions may use a different workspace from the process-wide interactive project. */
+	getProjectDir?(session: TSession): string;
 	gitEnabled(): boolean;
 	codexResetFireworksEnabled(): boolean;
 	getSettingsRevision(): number;

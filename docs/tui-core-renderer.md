@@ -226,7 +226,7 @@ The hello reply's optional `viewers` feature enables the multiplayer cockpit;
 `keys` additionally enables bounded key events. These features do not change
 ordinary Tern/interactive presentation. The shared inline `omp.session` surface
 keeps its main transcript, status/working dock and shared layer. Each
-window-local picker or Agents hub has a separate inline `omp.viewer` surface,
+window-local picker, Context/Usage/Git page or Agents hub has a separate inline `omp.viewer` surface,
 opened with `viewer` and ID `v.<viewer>.<n>`. The host authenticates that audience
 and filters outgoing surfaces; the backend maintains independent reconciliation,
 focus, overlays and input ownership. Closing a picker emits a normal surface
@@ -235,7 +235,13 @@ close, and `{ev:"viewer",viewer,present:false}` disposes its viewer hosts.
 Semantic events carry `viewer` through to components. Actions may carry `item`,
 `values` and object-valued `value`; `key` carries `{sf,viewer,data}` only to that
 viewer's focused component and accepts at most 4 KiB. Shared dock actions
-`model`, `effort` and `agents` open viewer UI; `interrupt`, tool approval
+`model`, `status.model`, `effort`, `agents`, `status.context`, `status.cost` and
+`status.git` open viewer UI. `status.path` is left for the browser host's Files
+pane. Context and Usage use their existing native components; Git takes the
+portable `GitOverlayHost` rendering/lifetime interface and the same repository
+adapter as `/git`, without constructing a TUI. Viewer departure disposes its Git
+page, stops subsequent refreshes and aborts pending diff loading. Close/Escape
+remain component-owned; `interrupt`, tool approval
 `allow`/`always`/`deny`, and `questions` `submit` are host-intercepted ACP
 controls, not alternate completion paths.
 

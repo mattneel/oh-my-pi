@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { $ } from "bun";
 import { type ChildProcess, spawn, type StdioOptions } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -6,7 +7,7 @@ import * as path from "node:path";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import type { Duplex, Writable } from "node:stream";
 import { encodeTspJson, TSP_PREFIX } from "@oh-my-pi/pi-tui/native/encode";
-import { TSP_KINDS, type TspEvent, type TspNode } from "@oh-my-pi/pi-wire";
+import { TSP_KINDS, type TspEvent, type TspNode, type TspText } from "@oh-my-pi/pi-wire";
 import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 import { TspTestTerminal } from "../../tui/test/native/tsp-harness";
 import { ONE_PIXEL_PNG } from "./helpers/skill-image-vision";
@@ -284,7 +285,10 @@ class SideChannel extends TspTestTerminal {
 	}
 
 	async waitForNode(predicate: (node: TspNode) => boolean, surface?: string): Promise<TspNode> {
-		return this.changes.wait("semantic transcript node", () => this.find(predicate, surface));
+		return this.changes.wait(
+			`semantic node ${predicate.toString()} on ${surface ?? this.surface ?? "(unopened)"}`,
+			() => this.find(predicate, surface),
+		);
 	}
 
 	assertValid(): void {
@@ -354,8 +358,8 @@ async function isolatedEnvironment(): Promise<{ cwd: string; env: NodeJS.Process
 	return { cwd, env };
 }
 
-async function seedSession(cwd: string, env: NodeJS.ProcessEnv, imageCount = 1): Promise<string> {
-	const proc = Bun.spawn([process.execPath, seedEntry, String(imageCount)], {
+async function seedSession(cwd: string, env: NodeJS.ProcessEnv, imageCount = 1, statusUsage = false): Promise<string> {
+	const proc = Bun.spawn([process.execPath, seedEntry, String(imageCount), ...(statusUsage ? ["status"] : [])], {
 		cwd,
 		env,
 		stdout: "pipe",
@@ -430,6 +434,30 @@ async function connectInheritedSocket(socketPath: string): Promise<Socket> {
 	});
 	await changes.wait("inherited Unix socket connection", () => (connected ? true : undefined));
 	return socket;
+}
+
+function wireText(value: TspText | undefined): string {
+	return typeof value === "string" ? value : (value?.map(span => span.t).join("") ?? "");
+}
+
+function viewerOpens(host: SideChannel, viewer: string): string[] {
+	return host.log.flatMap(message =>
+		message.verb === "o" &&
+		isRecord(message.body) &&
+		message.body.viewer === viewer &&
+		typeof message.body.id === "string"
+			? [message.body.id]
+			: [],
+	);
+}
+
+async function waitForViewerClose(host: SideChannel, surface: string): Promise<void> {
+	await host.changes.wait(`viewer surface ${surface} disposal`, () =>
+		host.log.some(message => message.verb === "x" && isRecord(message.body) && message.body.id === surface)
+			? true
+			: undefined,
+	);
+	expect(host.docs.has(surface)).toBe(false);
 }
 
 /** The HTTP gates hold actual extension cleanup, not an estimate of how long abort takes. */
@@ -1001,6 +1029,209 @@ describe.skipIf(process.platform === "win32")("ACP TSP side channel", () => {
 			await provider.stop(true);
 		}
 	}, 60_000);
+
+	it("opens context, usage, and git from emitted dock actions only in the requesting viewer", async () => {
+		const { cwd, env } = await isolatedEnvironment();
+		const modelsFile = path.join(env.PI_CODING_AGENT_DIR!, "models.yml");
+		const models = JSON.parse(await Bun.file(modelsFile).text());
+		// Leave room for the saved context, the default reserve, and free space.
+		models.providers["acp-fixture"].models[0].contextWindow = 65536;
+		await Bun.write(modelsFile, JSON.stringify(models));
+		const sessionId = await seedSession(cwd, env, 0, true);
+		const gitEnv = {
+			...env,
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_SYSTEM: "/dev/null",
+			GIT_CONFIG_NOSYSTEM: "1",
+			GIT_AUTHOR_NAME: "Test User",
+			GIT_AUTHOR_EMAIL: "test@example.com",
+			GIT_COMMITTER_NAME: "Test User",
+			GIT_COMMITTER_EMAIL: "test@example.com",
+		};
+		await $`git init --template= --initial-branch=acp-status`.env(gitEnv).cwd(cwd).quiet();
+		await Bun.write(path.join(cwd, "status-overlay.txt"), "Saved git baseline\n");
+		await $`git add status-overlay.txt`.env(gitEnv).cwd(cwd).quiet();
+		await $`git -c commit.gpgsign=false commit -m "Status overlay fixture"`.env(gitEnv).cwd(cwd).quiet();
+		await Bun.write(path.join(cwd, "status-overlay.txt"), "Viewer-local git change\n");
+		const socketPath = path.join(path.dirname(cwd), "status-overlays.sock");
+		const listener = await listen(socketPath);
+		// The ACP session's repository must not depend on the server process's cwd.
+		const proc = new CliProcess(["acp", "--tsp", socketPath], path.dirname(cwd), gitEnv);
+		const host = new SideChannel(await listener.connection, ["blobs", "settle", "dock", "viewers", "keys"]);
+		await initializeAndLoad(proc, cwd, sessionId);
+		const shared = host.surface!;
+		const transcript = await host.waitForNode(
+			node => node.k === "md" && node.p?.text === "Saved assistant transcript",
+			shared,
+		);
+		const dock = await host.waitForNode(node => node.p?.role === "omp.dock", shared);
+		const model = await host.waitForNode(node => node.p?.role === "omp.composer.model", shared);
+		const modelAction = model.p?.actions?.click;
+		if (!modelAction) throw new Error("The dock model control omitted its click action");
+		host.event({ ev: "action", sf: shared, id: model.id, act: modelAction, viewer: "window-b", mods: [] });
+		const other = await host.changes.wait(
+			"viewer B's independent model picker",
+			() => viewerOpens(host, "window-b")[0],
+		);
+		await host.waitForNode(node => node.k === "picker", other);
+		host.event({ ev: "key", sf: other, viewer: "window-b", data: "transcript" });
+		const otherPicker = await host.waitForNode(node => node.k === "picker" && node.p?.query === "transcript", other);
+		const otherOpenCount = viewerOpens(host, "window-b").length;
+		const sharedOpenCount = host.log.filter(
+			message => message.verb === "o" && isRecord(message.body) && message.body.id === shared,
+		).length;
+		const isStatusOverlay = (node: TspNode): boolean =>
+			node.p?.role === "omp.context" ||
+			node.p?.role === "omp.usage.body" ||
+			node.p?.role === "omp.app.git" ||
+			node.p?.role === "omp.app.git-narrow";
+		const assertIsolated = (surface: string): void => {
+			expect(surface).toMatch(/^v\.window-a\./);
+			expect(viewerOpens(host, "window-b")).toHaveLength(otherOpenCount);
+			expect(host.find(isStatusOverlay, other)).toBeUndefined();
+			expect(host.find(isStatusOverlay, shared)).toBeUndefined();
+			expect(host.find(node => node.id === otherPicker.id, other)?.p).toHaveProperty("query", "transcript");
+			expect(host.find(node => node.id === transcript.id, shared)?.p).toHaveProperty(
+				"text",
+				"Saved assistant transcript",
+			);
+			expect(host.find(node => node.id === dock.id, shared)).toBeDefined();
+			expect(
+				host.log.filter(message => message.verb === "o" && isRecord(message.body) && message.body.id === shared),
+			).toHaveLength(sharedOpenCount);
+		};
+		for (const action of ["status.context", "status.cost", "status.git"] as const) {
+			for (const closeWith of ["escape", "button"] as const) {
+				// Select the node the real CLI emitted, not a synthetic status action.
+				const control = await host.waitForNode(node => node.p?.actions?.click === action, shared);
+				expect(host.find(node => node.id === control.id, shared)).toBeDefined();
+				// These status controls currently carry tooltips, not actionable hovercards.
+				expect(control.p?.hovercard).toBeUndefined();
+				if (action === "status.context") {
+					expect(control.p?.title).toMatch(/Context.*used/);
+				} else if (action === "status.cost") {
+					expect(control.p?.title).toMatch(/Session cost.*0\.13/);
+				}
+				const openCount = viewerOpens(host, "window-a").length;
+				host.event({
+					ev: "action",
+					sf: shared,
+					id: control.id,
+					act: control.p!.actions!.click!,
+					viewer: "window-a",
+					mods: [],
+				});
+				const surface = await host.changes.wait(`${action} viewer A surface`, () => {
+					const opened = viewerOpens(host, "window-a");
+					return opened.length > openCount ? opened[openCount] : undefined;
+				});
+				await host.waitForNode(isStatusOverlay, surface);
+				assertIsolated(surface);
+				if (action === "status.context") {
+					await host.waitForNode(node => node.p?.role === "omp.context", surface);
+					const used = await host.waitForNode(node => node.p?.role === "omp.context.used", surface);
+					expect(used.k === "text" ? wireText(used.p?.spans) : "").toContain("of 66K tokens");
+					const meter = await host.waitForNode(
+						node => node.k === "meter" && node.p?.aria === "Context usage by category",
+						surface,
+					);
+					if (meter.k !== "meter") throw new Error("Context did not emit its native stacked meter");
+					expect(meter.p?.value).toBeGreaterThan(0);
+					expect(meter.p?.value).toBeLessThan(1);
+					expect(meter.p?.parts?.length).toBeGreaterThan(2);
+					expect(meter.p?.parts?.find(part => part.token === "track")?.value).toBeGreaterThan(0);
+					for (const label of [
+						"System Prompt (excluding Skills)",
+						"User / Developer Messages",
+						"Assistant Messages",
+						"Tool Calls",
+						"Tool Output",
+						"lookup_thing",
+						"inspect_status",
+						"Auto-Compact Buffer",
+						"Free Space",
+					]) {
+						const category = await host.waitForNode(
+							node => node.k === "item" && wireText(node.p?.label).trim().endsWith(label),
+							surface,
+						);
+						if (category.k !== "item") throw new Error(`Missing native context category ${label}`);
+						expect(wireText(category.p?.value)).toMatch(/\d.*%/);
+					}
+					const categories = await host.waitForNode(
+						node => node.k === "list" && node.p?.actions?.dblclick === "activate",
+						surface,
+					);
+					host.event({
+						ev: "activate",
+						sf: surface,
+						id: categories.id,
+						item: "tool-output/tool-0",
+						viewer: "window-a",
+					});
+					await host.waitForNode(
+						node => node.k === "text" && wireText(node.p?.spans).includes("Saved result row 29"),
+						surface,
+					);
+					if (closeWith === "escape") {
+						host.event({ ev: "key", sf: surface, viewer: "window-a", data: "\x1b" });
+						await host.waitForNode(
+							node => node.k === "list" && node.p?.actions?.dblclick === "activate",
+							surface,
+						);
+					}
+				} else if (action === "status.cost") {
+					await host.waitForNode(node => node.p?.role === "omp.usage.head", surface);
+					// Activity is streamed independently; the real Overview may already contain history.
+					await host.waitForNode(
+						node => node.p?.role === "omp.usage.quotas" || node.p?.role === "omp.usage.empty",
+						surface,
+					);
+					const tabs = await host.waitForNode(node => node.k === "tabs", surface);
+					host.event({ ev: "select", sf: surface, id: tabs.id, item: "detail", viewer: "window-a" });
+					await host.waitForNode(node => node.k === "tabs" && node.p?.active === "detail", surface);
+					await host.waitForNode(node => node.p?.role === "omp.usage.none", surface);
+					if (closeWith === "escape") {
+						host.event({ ev: "key", sf: surface, viewer: "window-a", data: "\x1b" });
+						await host.waitForNode(node => node.k === "tabs" && node.p?.active === "overview", surface);
+					}
+				} else {
+					await host.waitForNode(node => node.p?.role === "omp.app.git.side", surface);
+					await host.waitForNode(
+						node => node.k === "item" && wireText(node.p?.label).includes("status-overlay.txt"),
+						surface,
+					);
+					await host.waitForNode(
+						node => node.k === "text" && wireText(node.p?.spans).includes("acp-status"),
+						surface,
+					);
+				}
+				assertIsolated(surface);
+				if (closeWith === "escape") {
+					host.event({ ev: "key", sf: surface, viewer: "window-a", data: "\x1b" });
+				} else {
+					const close = await host.waitForNode(
+						node => node.p?.actions?.click === "close" && node.p.title?.startsWith("Close") === true,
+						surface,
+					);
+					host.event({
+						ev: "action",
+						sf: surface,
+						id: close.id,
+						act: close.p!.actions!.click!,
+						viewer: "window-a",
+						mods: [],
+					});
+				}
+				await waitForViewerClose(host, surface);
+				assertIsolated(surface);
+			}
+		}
+		host.event({ ev: "viewer", viewer: "window-b", present: false });
+		await waitForViewerClose(host, other);
+		await proc.request("session/close", { sessionId });
+		await gracefulShutdown(proc, host);
+	}, 90_000);
 
 	it("loads a real transcript over an ordinary Unix socket, applies native events, and releases it on ACP EOF", async () => {
 		const { cwd, env } = await isolatedEnvironment();
