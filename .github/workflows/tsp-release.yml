@@ -71,6 +71,8 @@ jobs:
               bun test
               packages/coding-agent/test/acp-tsp.test.ts
               packages/coding-agent/test/acp-tsp-presentation.test.ts
+              packages/coding-agent/test/acp-agent.test.ts
+              packages/utils/test/acp.test.ts
               packages/coding-agent/test/cli-tsp-flag.test.ts
               packages/coding-agent/test/cli-non-tty-launch.test.ts
               packages/tui/test/native/encode.test.ts

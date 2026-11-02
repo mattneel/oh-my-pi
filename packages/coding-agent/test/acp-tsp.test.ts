@@ -609,6 +609,10 @@ describe.skipIf(process.platform === "win32")("ACP TSP side channel", () => {
 			expect(settled.p).not.toHaveProperty("ask");
 			expect(calls).toBe(2);
 			expect(configUpdates()).toHaveLength(configBaseline + 2);
+			// Await session-owned producers, including a bootstrap update that
+			// may still be scanning commands, before closing the ACP stream.
+			const closed = await proc.request("session/close", { sessionId: created.result?.sessionId });
+			expect(closed.error).toBeUndefined();
 			await gracefulShutdown(proc, host);
 		} finally {
 			await provider.stop(true);

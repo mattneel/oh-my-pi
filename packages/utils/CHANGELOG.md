@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- ACP connections drop writes queued after closure and report outbound failures through the connection lifetime and pending requests, preventing unhandled notification rejections during teardown.
+
 ## [18.15.0] - 2026-11-01
 
 ### Added

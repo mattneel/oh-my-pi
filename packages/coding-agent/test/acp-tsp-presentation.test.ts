@@ -434,14 +434,17 @@ function createPresentationControl(
 			controller.enqueue(message);
 		},
 	});
+	let agent: AcpAgent;
 	const agentConnection = new AgentSideConnection(
-		connection =>
-			new AcpAgent(
+		connection => {
+			agent = new AcpAgent(
 				connection,
 				async () => ({ session: fixture.session, setToolUIContext }),
 				fixture.session,
 				fixture.presentation,
-			),
+			);
+			return agent;
+		},
 		{ readable: toAgent.readable, writable: toClient.writable },
 	);
 	const client = new ClientSideConnection(
@@ -456,8 +459,13 @@ function createPresentationControl(
 		messages,
 		client,
 		async close() {
-			await Promise.all([toAgent.writable.close(), toClient.writable.close()]);
-			await Promise.all([agentConnection.closed, client.closed]);
+			// Stop producers and await in-flight bootstrap delivery before
+			// closing either stream. EOF then drains accepted RPC handlers.
+			await agent.dispose();
+			await toAgent.writable.close();
+			await agentConnection.closed;
+			await toClient.writable.close();
+			await client.closed;
 		},
 	};
 }

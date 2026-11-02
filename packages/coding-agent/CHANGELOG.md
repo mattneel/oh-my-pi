@@ -8,6 +8,10 @@
 - ACP cockpit hosts can negotiate per-window model/effort pickers and the Agents hub, a shared status/Stop dock, tool approvals and questions while keeping all completions on ACP.
 - ACP cockpit transcripts preserve durable assistant and Yard turn keys across reload/replay, separate explicit Yard context from visible messages, and retain complete folded tool content.
 
+### Fixed
+
+- ACP session teardown cancels pending bootstrap notifications and awaits in-flight delivery before releasing the session, preventing late updates from racing closed client streams.
+
 ## [18.15.0] - 2026-11-01
 
 ### Added
