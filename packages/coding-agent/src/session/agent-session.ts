@@ -1266,6 +1266,7 @@ export class AgentSession implements SettingsScope {
 	 *  incremented, so `isStreaming` alone cannot tell a host that a submission is admitted. */
 	#admittedSubmissionCount = 0;
 	#admittedSubmissionsSettled: PromiseWithResolvers<void> | undefined;
+	#streamingSessionEntryId: string | undefined;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
 	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
 	// checks in #handleAgentEvent) still fire on the original schedule — only the
@@ -4008,6 +4009,14 @@ export class AgentSession implements SettingsScope {
 	 * the recovery wait always sees the in-flight handler and blocks until it — and
 	 * everything it schedules — settles. */
 	#dispatchAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (
+			(event.type === "message_start" || event.type === "message_update" || event.type === "message_end") &&
+			event.message.role === "assistant"
+		) {
+			if (event.type === "message_start") this.#streamingSessionEntryId = undefined;
+			event.message.sessionEntryId ??= this.#streamingSessionEntryId ?? this.sessionManager.reserveMessageEntryId();
+			this.#streamingSessionEntryId = event.type === "message_end" ? undefined : event.message.sessionEntryId;
+		}
 		// Revoke before the first await: delayed end-of-turn maintenance must
 		// never revoke a foreground-control grant acquired by a later prompt.
 		const computerControlRevocation =
@@ -8300,6 +8309,7 @@ export class AgentSession implements SettingsScope {
 			const queued = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
+				clankyard: options?.clankyard,
 				prependMessages: prependNotices,
 				rawText: typedText,
 				onPromptQueued: options?.onPromptQueued,
@@ -8376,6 +8386,7 @@ export class AgentSession implements SettingsScope {
 			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
+				clankyard: options?.clankyard,
 				prependMessages: prependNotices,
 				rawText: typedText,
 				preprocessed: {
@@ -8404,7 +8415,13 @@ export class AgentSession implements SettingsScope {
 					synthetic: true,
 					userInitiated: options?.userInitiated === true ? true : undefined,
 				}
-			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: submittedAt };
+			: {
+					role: "user" as const,
+					content: userContent,
+					attribution: promptAttribution,
+					timestamp: submittedAt,
+					clankyard: options?.clankyard,
+				};
 
 		const preludeMessages: AgentMessage[] = [];
 		if (eagerTodoPrelude) {
@@ -9376,7 +9393,7 @@ export class AgentSession implements SettingsScope {
 	async joinActiveTurn(
 		text: string,
 		images?: ImageContent[],
-		options?: { queue?: "steering" | "followUp" },
+		options?: { queue?: "steering" | "followUp"; clankyard?: PromptOptions["clankyard"] },
 	): Promise<boolean> {
 		// Liveness first: an idle session hands the content back
 		// (`promptRequired` at the ACP bridge) without validating it — the
@@ -9433,6 +9450,7 @@ export class AgentSession implements SettingsScope {
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
 		return await this.#queueUserMessage(expandedText, images, mode, {
 			timestamp: Date.now(),
+			clankyard: options?.clankyard,
 			rawText: text,
 			requireActiveRun: true,
 			skipIdleDrain: true,
@@ -9473,6 +9491,7 @@ export class AgentSession implements SettingsScope {
 		options?: {
 			timestamp?: number;
 			attribution?: MessageAttribution;
+			clankyard?: PromptOptions["clankyard"];
 			prependMessages?: readonly CustomMessage[];
 			/** Text the caller originally submitted, before slash/custom-command
 			 *  rewriting, prompt-template expansion, or `^model` mention substitution.
@@ -9575,7 +9594,13 @@ export class AgentSession implements SettingsScope {
 			if (await this.#sessionGenerationChanged(sessionGeneration)) return false;
 			const records: AgentMessage[] = [...prependMessages, ...attachmentSourceNotices];
 			if (imageDescriptionNotice) records.push(imageDescriptionNotice);
-			const userMessage: AgentMessage = { role: "user", content, attribution, timestamp: timestamp ?? Date.now() };
+			const userMessage: AgentMessage = {
+				role: "user",
+				content,
+				attribution,
+				timestamp: timestamp ?? Date.now(),
+				clankyard: options?.clankyard,
+			};
 			this.#queuedMessageRawText.set(userMessage, rawText);
 			records.push(userMessage);
 			this.#irc.queueAside(records);
@@ -9601,6 +9626,7 @@ export class AgentSession implements SettingsScope {
 				content,
 				attribution,
 				timestamp: timestamp ?? Date.now(),
+				clankyard: options?.clankyard,
 			};
 			this.#queuedMessageRawText.set(userMessage, rawText);
 			this.agent.followUp(userMessage);
@@ -9614,6 +9640,7 @@ export class AgentSession implements SettingsScope {
 				steering: true,
 				attribution,
 				timestamp: timestamp ?? Date.now(),
+				clankyard: options?.clankyard,
 			};
 			this.#queuedMessageRawText.set(userMessage, rawText);
 			this.agent.steer(userMessage);

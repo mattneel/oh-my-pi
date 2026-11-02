@@ -603,6 +603,13 @@ export class AssistantMessageComponent extends Container {
 	readonly #imageBudget?: ImageBudget;
 	#proseOnlyThinking: boolean;
 	#expandThinkingBlocks: boolean;
+	#nativeKey: string | undefined;
+
+	/** Set a durable host identity without changing ordinary transcript rendering. */
+	setNativeKey(key: string | undefined): void {
+		if (this.#nativeKey !== key) this.#blockVersion++;
+		this.#nativeKey = key;
+	}
 
 	constructor(
 		message?: AssistantMessage,
@@ -900,6 +907,7 @@ export class AssistantMessageComponent extends Container {
 				: 0;
 		const key = [
 			this.#blockVersion,
+			this.#nativeKey,
 			this.#transcriptBlockFinalized,
 			this.#hideThinkingBlock,
 			this.#showImages,
@@ -1131,7 +1139,7 @@ export class AssistantMessageComponent extends Container {
 				node("row", { role: "omp.turn.usage", gap: "xs", align: "center", title: usage.title }, line, "turn-usage"),
 			);
 		}
-		return col(children, { role: this.#rewound ? "omp.assistant.rewound" : "omp.assistant" });
+		return col(children, { key: this.#nativeKey, role: this.#rewound ? "omp.assistant.rewound" : "omp.assistant" });
 	}
 
 	/**

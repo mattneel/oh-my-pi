@@ -20,7 +20,14 @@ import {
 	toolRenderers,
 } from "../tools/index";
 import { describeDefaultToolExecution, formatDefaultToolExecution } from "../tools/default-renderer";
-import { INTENT_FIELD, type TspCardStatus, type TspPreview, type TspText, type TspTone } from "@oh-my-pi/pi-wire";
+import {
+	INTENT_FIELD,
+	type TspCardStatus,
+	type TspPreview,
+	type TspText,
+	type TspTone,
+	type TspToolProps,
+} from "@oh-my-pi/pi-wire";
 import { card, col, EMPTY_NODE, node, span, text, withHidden } from "../native/describe";
 import {
 	type DescribeContext,
@@ -220,7 +227,12 @@ export interface ToolExecutionOptions {
 	showImages?: boolean; // default: true (only used if terminal supports images)
 	/** Allow the name-keyed renderer registry only when the active tool is the built-in implementation. */
 	useBuiltInRenderer?: boolean;
+	/** Retain every native body node while folds and previews remain viewer-local. */
+	retainFullContent?: boolean;
 }
+
+/** ACP-owned approval state; tool cards only project it and never answer requests. */
+export type ToolPermissionState = Pick<TspToolProps, "ask" | "confirm" | "approved"> & { status?: "ask" };
 
 /** A tool result or progress frame as a card shows it. */
 export interface ToolResultFrame {
@@ -288,6 +300,7 @@ export function settleWithJobFrame(component: ToolExecutionHandle, frame: ToolRe
 
 /** Card tone per status when the renderer doesn't choose one; settled cards stay neutral. */
 const NATIVE_STATUS_TONE: Record<TspCardStatus, TspTone | undefined> = {
+	ask: "warning",
 	pending: "pending",
 	running: "pending",
 	done: undefined,
@@ -458,8 +471,19 @@ export class ToolExecutionComponent extends Container {
 	#executionStartedAtNow: number | undefined;
 	// When the call settled (final result or seal), same clock; freezes the native elapsed timer.
 	#executionEndedAtNow: number | undefined;
-	readonly #toolCallId: string | undefined;
+	#toolCallId: string | undefined;
 	readonly #native = new Memo();
+	readonly #retainFullContent: boolean;
+	#permission: ToolPermissionState | undefined;
+
+	get toolCallId(): string | undefined {
+		return this.#toolCallId;
+	}
+
+	setToolPermission(permission: ToolPermissionState | undefined): void {
+		if (this.#permission !== permission) this.#blockVersion++;
+		this.#permission = permission;
+	}
 	// LSP diagnostics that arrived after the result (native only), shown in the frame.
 	#lateDiagnostics: readonly FileDiagnosticsResult[] | undefined;
 	readonly #nativeImages = new NativeImageCache();
@@ -503,6 +527,7 @@ export class ToolExecutionComponent extends Container {
 		});
 		ensureThemeSync();
 		this.#toolCallId = toolCallId;
+		this.#retainFullContent = options.retainFullContent === true;
 		this.#toolName = toolName;
 		this.#toolLabel = tool?.label ?? toolName;
 		this.#renderer = options.useBuiltInRenderer === false ? undefined : toolRenderers[toolName];
@@ -537,7 +562,8 @@ export class ToolExecutionComponent extends Container {
 		this.#updateDisplay();
 	}
 
-	updateArgs(args: unknown, _toolCallId?: string): void {
+	updateArgs(args: unknown, toolCallId?: string): void {
+		if (toolCallId !== undefined) this.#toolCallId = toolCallId;
 		// Reference-equality short-circuit before any further work. Callers
 		// always allocate a new arg object on each streamed delta (see
 		// event-controller.ts and ui-helpers.ts), so a same-reference assignment
@@ -1027,6 +1053,8 @@ export class ToolExecutionComponent extends Container {
 		const host: NativeHostKinds = { media: cx?.supports("media") === true, json: cx?.supports("json") === true };
 		const key = [
 			dataFirst,
+			this.#permission,
+			this.#toolCallId,
 			this.#resultVersion,
 			this.#expanded,
 			this.#isPartial,
@@ -1120,7 +1148,10 @@ export class ToolExecutionComponent extends Container {
 				badges: badges.length > 0 ? badges : undefined,
 				note: head?.note ?? (status === "cancelled" && !this.#isBenignSkip() ? "cancelled" : undefined),
 				exit: head?.exit ?? undefined,
-				status,
+				status: this.#permission?.status ?? status,
+				ask: this.#permission?.ask,
+				confirm: this.#permission?.confirm,
+				approved: this.#permission?.approved,
 				age: live ? ms : undefined,
 				took: live ? undefined : ms,
 				intent: typeof intent === "string" && intent ? plainText(intent) : undefined,
@@ -1217,13 +1248,15 @@ export class ToolExecutionComponent extends Container {
 		const status = this.#nativeStatus();
 		const options: RenderResultContextOptions = {
 			...host,
-			expanded: this.#expanded,
+			expanded: this.#retainFullContent || this.#expanded,
 			isPartial: this.#isPartial,
 			argsComplete: this.#argsComplete,
 			executionStarted: this.#executionStarted,
 			elapsedMs: this.#elapsedMs(status),
 			cancelled: status === "cancelled",
-			renderContext: this.#buildRenderContext(),
+			renderContext: this.#retainFullContent
+				? { ...this.#buildRenderContext(), expanded: true }
+				: this.#buildRenderContext(),
 		};
 		// Custom tools (MCP, extensions) carry their own describe hooks, mirroring
 		// the ANSI path's preference for the tool's renderCall/renderResult.

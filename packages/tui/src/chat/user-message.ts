@@ -58,6 +58,9 @@ const OSC133_ZONE_CLOSE = OSC133_ZONE_END + OSC133_COMMAND_START + OSC133_COMMAN
 
 /** How a user bubble styles its prose and chips (see {@link userBubbleColor}). */
 export interface UserBubbleOptions {
+	/** Host-owned durable turn identity and explicitly separated context, native presentation only. */
+	key?: string;
+	context?: string;
 	/** Filesystem paths for attached image chips, indexed by chip number. */
 	imageLinks?: readonly (string | undefined)[];
 	/** The message's attached images in chip order (`#1` first); a native bubble shows them. */
@@ -138,6 +141,8 @@ export class UserMessageComponent extends Container implements ReactionTarget, T
 	readonly #synthetic: boolean;
 	readonly #timestamp: number | undefined;
 	readonly #images: readonly ImageContent[];
+	readonly #key: string | undefined;
+	readonly #context: string | undefined;
 	readonly #imageLinks: readonly (string | undefined)[] | undefined;
 	/** Display text: image markers collapsed to chips and model mentions to their labels. */
 	readonly #text: string;
@@ -168,6 +173,8 @@ export class UserMessageComponent extends Container implements ReactionTarget, T
 		this.#liveSteered = options.liveSteered === true;
 		this.#synthetic = options.synthetic === true;
 		this.#timestamp = options.timestamp;
+		this.#key = options.key;
+		this.#context = options.context;
 		this.#images = options.images ?? [];
 		this.#imageLinks = options.imageLinks;
 		this.#text = text;
@@ -266,6 +273,16 @@ export class UserMessageComponent extends Container implements ReactionTarget, T
 		}
 		const marks = this.#synthetic ? [] : tokenMarks(this.#text, this.#tokens, this.#imageLinks);
 		children.push(md(this.#text, marks.length > 0 ? { marks } : undefined));
+		if (this.#context !== undefined) {
+			children.push(
+				node(
+					"section",
+					{ role: "clankyard.context", head: "Yard context", collapsible: true, collapsed: true },
+					[md(this.#context)],
+					"context",
+				),
+			);
+		}
 		const badges: NativeChild[] = [];
 		if (this.#liveSteered) {
 			badges.push(
@@ -280,7 +297,11 @@ export class UserMessageComponent extends Container implements ReactionTarget, T
 		if (badges.length > 0)
 			children.push(node("row", { gap: "xs", justify: "end", role: "omp.user.badges" }, badges, "badges"));
 		this.#native = card(
-			{ role: this.#synthetic ? "omp.user.synthetic" : "omp.user", tone: this.#synthetic ? "muted" : "user" },
+			{
+				key: this.#key,
+				role: this.#synthetic ? "omp.user.synthetic" : "omp.user",
+				tone: this.#synthetic ? "muted" : "user",
+			},
 			children,
 		);
 		return this.#native;

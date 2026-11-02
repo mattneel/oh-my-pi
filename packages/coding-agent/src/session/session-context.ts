@@ -419,6 +419,7 @@ export function buildSessionContext(
 	const appendMessage = (entry: SessionEntry) => {
 		handleEntryResetTracking(entry);
 		if (entry.type === "message") {
+			if (entry.message.role === "assistant") entry.message.sessionEntryId = entry.id;
 			if (
 				!options?.transcript &&
 				entry.message.role === "assistant" &&

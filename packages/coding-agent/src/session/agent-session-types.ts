@@ -439,6 +439,8 @@ export interface AgentSessionConfig {
 
 /** Options for AgentSession.prompt(). */
 export interface PromptOptions {
+	/** Explicit host presentation metadata, persisted separately from the model prompt. */
+	clankyard?: { turnId?: string; context?: string; displayText: string };
 	/** Whether to expand file-based prompt templates (default: true). */
 	expandPromptTemplates?: boolean;
 	/**
