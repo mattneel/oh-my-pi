@@ -228,6 +228,13 @@ export class AcpPresentation {
 		this.requestRender();
 	}
 
+	/** ACP Stop dismisses working chrome immediately; only its wire response waits. */
+	cancelSession(session: AgentSession): void {
+		if (session !== this.#session) return;
+		this.#cockpit?.cancel();
+		this.requestRender();
+	}
+
 	#remember(message: AgentMessage): boolean {
 		const key =
 			sessionMessagePersistenceKey(message) ??

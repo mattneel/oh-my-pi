@@ -74,9 +74,12 @@ export interface Client {
 /** Agent-side ACP connection. */
 export class AgentSideConnection {
 	#connection: RpcConnection;
+	#responseWrites = new WeakMap<object, Promise<void>>();
 
 	constructor(toAgent: (connection: AgentSideConnection) => Agent, stream: Stream) {
-		this.#connection = new RpcConnection(stream, async (method, params, notification) => {
+		this.#connection = new RpcConnection(stream, async (method, params, notification, _signal, responseWritten) => {
+			if (responseWritten && typeof params === "object" && params !== null)
+				this.#responseWrites.set(params, responseWritten);
 			if (!agent) throw RequestError.internalError(undefined, "Agent is not initialized");
 			return dispatchAgent(agent, method, params, notification);
 		});
@@ -90,6 +93,30 @@ export class AgentSideConnection {
 	/** Promise resolved when the transport closes. */
 	get closed(): Promise<void> {
 		return this.#connection.closed;
+	}
+	/**
+	 * Waits for wire-pending agent→client requests belonging to this session.
+	 * Cancelled requests require both their cancellation notification write and
+	 * a correlated client result/error. Rejects if the connection closes while
+	 * waiting; callers own the deadline for unresponsive clients.
+	 */
+	waitForSessionRequests(sessionId: string): Promise<void> {
+		return this.#connection.waitForSessionRequests(sessionId);
+	}
+	/**
+	 * Cancels pending local requests for this session. Wire replies remain
+	 * tracked by waitForSessionRequests, including requests without cancel handles.
+	 */
+	cancelSessionRequests(sessionId: string): void {
+		this.#connection.cancelSessionRequests(sessionId);
+	}
+	/**
+	 * Resolves once the inbound request using this exact params object has
+	 * written its result/error. Direct calls with untracked params are already
+	 * settled; no peer response is expected for them.
+	 */
+	responseWritten(params: object): Promise<void> {
+		return this.#responseWrites.get(params) ?? Promise.resolve();
 	}
 	/** Sends a session update notification. */
 	sessionUpdate(params: SessionNotification): Promise<void> {

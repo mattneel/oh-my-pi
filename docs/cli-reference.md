@@ -259,6 +259,22 @@ print-mode disposal semantics when the advisor runtime is enabled.
 
 ### ACP presentation
 
+ACP `initialize` advertises
+`agentCapabilities._meta["omp/settledResponses"] = true`. Responses to
+`session/new`, `session/load`, `session/resume` and `session/prompt` are settled
+boundaries: cleanup has completed, the turn's updates have been written, and
+no agent-to-client request for that session is still awaiting its result or
+error. This includes failed and cancelled prompts. A cancellation notification
+alone is not a callback result; the client must answer its cancelled request
+(normally with JSON-RPC error `-32800`).
+
+Stop still dismisses the TSP working row immediately. Its ACP prompt response
+waits for the existing bounded cleanup barrier, and prompts cancelled while
+queued answer before the active cancellation. If cleanup times out, omp closes
+the managed session before answering. Session bootstrap notifications may follow
+new/load/resume responses; pending client requests may not. The settled-response
+contract also applies without `--tsp`.
+
 ```sh
 omp acp --tsp                   # inherited duplex fd 3
 omp acp --tsp 4                 # inherited duplex fd 4

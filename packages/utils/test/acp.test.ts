@@ -194,9 +194,9 @@ describe("ACP JSON-RPC transport", () => {
 		const connection = new RpcConnection({ writable, readable: inbound.readable }, () => undefined);
 		const notification = connection.notify("event");
 		const request = connection.request("pending");
-		const rejected = expect(request).rejects.toBe(failure);
+		const rejected = request.catch((error: unknown) => error);
 		await notification;
-		await rejected;
+		expect(await rejected).toBe(failure);
 		await connection.closed;
 		expect(connection.signal.reason).toBe(failure);
 		expect(writes).toBe(1);
@@ -226,6 +226,417 @@ describe("ACP JSON-RPC transport", () => {
 		expect(messages).toEqual([{ jsonrpc: "2.0", method: "accepted" }]);
 		await inbound.writable.close();
 		await writable.close();
+	});
+
+	it.each(["success", "error"])("exposes inbound response write completion for %s responses", async outcome => {
+		const inbound = new TransformStream<AnyMessage>();
+		const writeStarted = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		const messages: AnyMessage[] = [];
+		const dispatched = Promise.withResolvers<{ responseWritten: Promise<void> }>();
+		const writable = new WritableStream<AnyMessage>({
+			async write(message) {
+				messages.push(message);
+				writeStarted.resolve();
+				await releaseWrite.promise;
+			},
+		});
+		const connection = new RpcConnection(
+			{ writable, readable: inbound.readable },
+			(_method, _params, _notification, _signal, written) => {
+				if (!written) throw new Error("Expected inbound response write promise");
+				dispatched.resolve({ responseWritten: written });
+				if (outcome === "error") throw RequestError.invalidParams();
+				return "result";
+			},
+		);
+		const writer = inbound.writable.getWriter();
+		await writer.write({ jsonrpc: "2.0", id: 42, method: "request", params: {} });
+		await writeStarted.promise;
+		const { responseWritten } = await dispatched.promise;
+		let settled = false;
+		const written = responseWritten.then(() => {
+			settled = true;
+		});
+		await connection.waitForSessionRequests("unrelated");
+		expect(settled).toBe(false);
+		expect(messages).toEqual([
+			outcome === "error"
+				? { jsonrpc: "2.0", id: 42, error: { code: -32602, message: "Invalid params" } }
+				: { jsonrpc: "2.0", id: 42, result: "result" },
+		]);
+		releaseWrite.resolve();
+		await written;
+		expect(settled).toBe(true);
+		await writer.close();
+		await connection.closed;
+		await writable.close();
+		writer.releaseLock();
+	});
+
+	it("looks up response writes by the agent handler's exact params object", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const writeStarted = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		const dispatched = Promise.withResolvers<{ responseWritten: Promise<void> }>();
+		const writable = new WritableStream<AnyMessage>({
+			async write() {
+				writeStarted.resolve();
+				await releaseWrite.promise;
+			},
+		});
+		const connection = new AgentSideConnection(
+			agent => ({
+				initialize: params => ({ protocolVersion: params.protocolVersion }),
+				newSession: params => {
+					dispatched.resolve({ responseWritten: agent.responseWritten(params) });
+					return { sessionId: "session" };
+				},
+				prompt: () => ({ stopReason: "end_turn" }),
+				cancel: () => {},
+			}),
+			{ writable, readable: inbound.readable },
+		);
+		await connection.responseWritten({});
+		const writer = inbound.writable.getWriter();
+		await writer.write({
+			jsonrpc: "2.0",
+			id: 42,
+			method: "session/new",
+			params: { cwd: "/project", mcpServers: [] },
+		});
+		await writeStarted.promise;
+		const { responseWritten } = await dispatched.promise;
+		let settled = false;
+		const written = responseWritten.then(() => {
+			settled = true;
+		});
+		await connection.responseWritten({ cwd: "/project", mcpServers: [] });
+		expect(settled).toBe(false);
+		releaseWrite.resolve();
+		await written;
+		await writer.close();
+		await connection.closed;
+		await writable.close();
+		writer.releaseLock();
+	});
+
+	it("settles only correlated requests for the requested session, including peer errors", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const outbound = new TransformStream<AnyMessage>();
+		const connection = new RpcConnection(
+			{ writable: outbound.writable, readable: inbound.readable },
+			() => undefined,
+		);
+		const reader = outbound.readable.getReader();
+		const writer = inbound.writable.getWriter();
+		const read = connection.request("fs/read_text_file", { sessionId: "first", path: "/read" });
+		const permission = connection.request("session/request_permission", { sessionId: "first" });
+		const elicitation = connection.request("elicitation/create", { sessionId: "second" });
+		const write = connection.request("fs/write_text_file", { sessionId: "second", path: "/write", content: "" });
+		const rejected = permission.catch((error: unknown) => error);
+		const frames = [];
+		for (let i = 0; i < 4; i++) {
+			const frame = (await reader.read()).value;
+			if (!frame || !("id" in frame)) throw new Error("Expected request");
+			frames.push(frame);
+		}
+		let firstSettled = false;
+		let secondSettled = false;
+		const firstBarrier = connection.waitForSessionRequests("first").then(() => {
+			firstSettled = true;
+		});
+		const secondBarrier = connection.waitForSessionRequests("second").then(() => {
+			secondSettled = true;
+		});
+		await connection.waitForSessionRequests("unrelated");
+		await writer.write({ jsonrpc: "2.0", id: "unknown", result: {} });
+		await writer.write({ jsonrpc: "2.0", id: frames[2].id, result: { action: "cancel" } });
+		await elicitation;
+		await writer.write({ jsonrpc: "2.0", id: frames[0].id, result: { content: "read" } });
+		await read;
+		expect(firstSettled).toBe(false);
+		expect(secondSettled).toBe(false);
+		await writer.write({
+			jsonrpc: "2.0",
+			id: frames[1].id,
+			error: { code: -32602, message: "Denied" },
+		});
+		await firstBarrier;
+		expect(await rejected).toMatchObject({ code: -32602, message: "Denied" });
+		expect(firstSettled).toBe(true);
+		expect(secondSettled).toBe(false);
+		await writer.write({ jsonrpc: "2.0", id: frames[3].id, result: {} });
+		await Promise.all([write, secondBarrier]);
+		expect(secondSettled).toBe(true);
+		connection.close();
+		await writer.close();
+		reader.releaseLock();
+		writer.releaseLock();
+	});
+
+	it("keeps draining matching requests started by a settling request's continuation", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const outbound = new TransformStream<AnyMessage>();
+		const connection = new RpcConnection(
+			{ writable: outbound.writable, readable: inbound.readable },
+			() => undefined,
+		);
+		const reader = outbound.readable.getReader();
+		const writer = inbound.writable.getWriter();
+		const first = connection.request("first", { sessionId: "session" });
+		const followOn = first.then(() => connection.request("follow-on", { sessionId: "session" }));
+		let settled = false;
+		const barriers = Promise.all([
+			connection.waitForSessionRequests("session"),
+			connection.waitForSessionRequests("session"),
+		]).then(() => {
+			settled = true;
+		});
+		const firstFrame = (await reader.read()).value;
+		if (!firstFrame || !("id" in firstFrame)) throw new Error("Expected request");
+		await writer.write({ jsonrpc: "2.0", id: firstFrame.id, result: {} });
+		const nextFrame = (await reader.read()).value;
+		if (!nextFrame || !("id" in nextFrame)) throw new Error("Expected follow-on request");
+		expect(settled).toBe(false);
+		await writer.write({ jsonrpc: "2.0", id: nextFrame.id, result: "done" });
+		await expect(followOn).resolves.toBe("done");
+		await barriers;
+		connection.close();
+		await writer.close();
+		reader.releaseLock();
+		writer.releaseLock();
+	});
+
+	it.each(["before", "after"])("waits for the cancellation write and a peer response arriving %s it", async order => {
+		const inbound = new TransformStream<AnyMessage>();
+		const cancelStarted = Promise.withResolvers<void>();
+		const releaseCancel = Promise.withResolvers<void>();
+		const messages: AnyMessage[] = [];
+		const writable = new WritableStream<AnyMessage>({
+			async write(message) {
+				messages.push(message);
+				if ("method" in message && message.method === "$/cancel_request") {
+					cancelStarted.resolve();
+					await releaseCancel.promise;
+				}
+			},
+		});
+		const connection = new RpcConnection({ writable, readable: inbound.readable }, () => undefined);
+		const writer = inbound.writable.getWriter();
+		const request = connection.requestCancellable("elicitation/create", { sessionId: "session" });
+		if (request.id === undefined) throw new Error("Expected cancellable request id");
+		const rejected = request.promise.catch((error: unknown) => error);
+		let settled = false;
+		const barrier = connection.waitForSessionRequests("session").then(() => {
+			settled = true;
+		});
+		request.cancel();
+		expect(await rejected).toMatchObject({ code: -32800 });
+		await cancelStarted.promise;
+		expect(settled).toBe(false);
+		expect(messages).toEqual([
+			{ jsonrpc: "2.0", id: request.id, method: "elicitation/create", params: { sessionId: "session" } },
+			{ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: request.id } },
+		]);
+		await connection.waitForSessionRequests("other");
+		const response: AnyMessage =
+			order === "before"
+				? { jsonrpc: "2.0", id: request.id, result: { action: "cancel" } }
+				: { jsonrpc: "2.0", id: request.id, error: { code: -32800, message: "Cancelled" } };
+		if (order === "before") {
+			// Even a peer reply cannot bypass an unfinished cancellation write.
+			await writer.write(response);
+			expect(settled).toBe(false);
+		}
+		request.cancel();
+		releaseCancel.resolve();
+		if (order === "after") {
+			// A subsequent queued write fences completion of the cancel write.
+			await connection.notify("write-fence");
+			expect(settled).toBe(false);
+			await writer.write({ jsonrpc: "2.0", id: "unrelated", result: {} });
+			expect(settled).toBe(false);
+			await writer.write(response);
+		}
+		await barrier;
+		await connection.waitForSessionRequests("session");
+		expect(messages.filter(message => "method" in message && message.method === "$/cancel_request")).toHaveLength(1);
+		expect(connection.signal.aborted).toBe(false);
+		connection.close();
+		await writer.close();
+		await writable.close();
+		writer.releaseLock();
+	});
+
+	it("rejects active session barriers and requests when the connection closes", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const writable = new WritableStream<AnyMessage>();
+		const connection = new RpcConnection({ writable, readable: inbound.readable }, () => undefined);
+		const failure = new Error("connection lost");
+		const request = connection.request("fs/read_text_file", { sessionId: "session", path: "/file" });
+		const requestRejected = request.catch((error: unknown) => error);
+		const barrierRejected = connection.waitForSessionRequests("session").catch((error: unknown) => error);
+		connection.close(failure);
+		const rejected = await Promise.all([requestRejected, barrierRejected]);
+		expect(rejected).toEqual([failure, failure]);
+		await expect(connection.waitForSessionRequests("session")).rejects.toBe(failure);
+		await inbound.writable.close();
+		await writable.close();
+	});
+
+	it("rejects a cancelled session barrier on close even if its cancellation write is held", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const cancelStarted = Promise.withResolvers<void>();
+		const releaseCancel = Promise.withResolvers<void>();
+		const writable = new WritableStream<AnyMessage>({
+			async write(message) {
+				if ("method" in message && message.method === "$/cancel_request") {
+					cancelStarted.resolve();
+					await releaseCancel.promise;
+				}
+			},
+		});
+		const connection = new RpcConnection({ writable, readable: inbound.readable }, () => undefined);
+		const request = connection.requestCancellable("session/request_permission", { sessionId: "session" });
+		const requestRejected = request.promise.catch((error: unknown) => error);
+		const barrierRejected = connection.waitForSessionRequests("session").catch((error: unknown) => error);
+		request.cancel();
+		expect(await requestRejected).toMatchObject({ code: -32800 });
+		await cancelStarted.promise;
+		connection.close();
+		expect(await barrierRejected).toMatchObject({ message: "Connection closed" });
+		releaseCancel.resolve();
+		await inbound.writable.close();
+		await writable.close();
+	});
+
+	it("cancels only matching session requests once while retaining wire settlement", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const messages: AnyMessage[] = [];
+		const writable = new WritableStream<AnyMessage>({
+			write(message) {
+				messages.push(message);
+			},
+		});
+		const connection = new AgentSideConnection(
+			() => ({
+				initialize: params => ({ protocolVersion: params.protocolVersion }),
+				newSession: () => ({ sessionId: "first" }),
+				prompt: () => ({ stopReason: "end_turn" }),
+				cancel: () => {},
+			}),
+			{ writable, readable: inbound.readable },
+		);
+		const writer = inbound.writable.getWriter();
+		const read = connection.readTextFile({ sessionId: "first", path: "/file" });
+		const permission = connection.requestPermissionWithCancel({
+			sessionId: "first",
+			toolCall: { toolCallId: "permission" },
+			options: [],
+		});
+		const other = connection.readTextFile({ sessionId: "second", path: "/file" });
+		const unscoped = connection.request("unscoped");
+		const readRejected = read.catch((error: unknown) => error);
+		const permissionRejected = permission.promise.catch((error: unknown) => error);
+		let firstSettled = false;
+		let secondSettled = false;
+		const firstBarrier = connection.waitForSessionRequests("first").then(() => {
+			firstSettled = true;
+		});
+		const secondBarrier = connection.waitForSessionRequests("second").then(() => {
+			secondSettled = true;
+		});
+		connection.cancelSessionRequests("first");
+		connection.cancelSessionRequests("first");
+		connection.cancelSessionRequests("unknown");
+		permission.cancel();
+		await connection.notify("write-fence");
+		expect(await readRejected).toMatchObject({ code: -32800, data: { method: "fs/read_text_file" } });
+		expect(await permissionRejected).toMatchObject({ code: -32800, data: { method: "session/request_permission" } });
+		const [readFrame, permissionFrame, otherFrame, unscopedFrame] = messages;
+		if (!("id" in readFrame) || !("id" in permissionFrame) || !("id" in otherFrame) || !("id" in unscopedFrame))
+			throw new Error("Expected outgoing request frames");
+		expect(messages.filter(message => "method" in message && message.method === "$/cancel_request")).toEqual([
+			{ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: readFrame.id } },
+			{ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: permissionFrame.id } },
+		]);
+		expect(firstSettled).toBe(false);
+		expect(secondSettled).toBe(false);
+		await writer.write({ jsonrpc: "2.0", id: readFrame.id, result: { content: "late" } });
+		expect(firstSettled).toBe(false);
+		await writer.write({
+			jsonrpc: "2.0",
+			id: permissionFrame.id,
+			error: { code: -32800, message: "Cancelled" },
+		});
+		await firstBarrier;
+		expect(firstSettled).toBe(true);
+		expect(secondSettled).toBe(false);
+		await writer.write({ jsonrpc: "2.0", id: otherFrame.id, result: { content: "other" } });
+		await writer.write({ jsonrpc: "2.0", id: unscopedFrame.id, result: "unscoped" });
+		await expect(other).resolves.toEqual({ content: "other" });
+		await expect(unscoped).resolves.toBe("unscoped");
+		await secondBarrier;
+		await writer.close();
+		await connection.closed;
+		await writable.close();
+		writer.releaseLock();
+	});
+
+	it("associates terminal creation and every terminal handle request with the creating session", async () => {
+		const inbound = new TransformStream<AnyMessage>();
+		const outbound = new TransformStream<AnyMessage>();
+		const connection = new AgentSideConnection(
+			() => ({
+				initialize: params => ({ protocolVersion: params.protocolVersion }),
+				newSession: () => ({ sessionId: "session" }),
+				prompt: () => ({ stopReason: "end_turn" }),
+				cancel: () => {},
+			}),
+			{ writable: outbound.writable, readable: inbound.readable },
+		);
+		const reader = outbound.readable.getReader();
+		const writer = inbound.writable.getWriter();
+		const creating = connection.createTerminal({ sessionId: "session", command: "shell" });
+		let created = false;
+		const creationBarrier = connection.waitForSessionRequests("session").then(() => {
+			created = true;
+		});
+		const createFrame = (await reader.read()).value;
+		if (!createFrame || !("id" in createFrame)) throw new Error("Expected terminal creation");
+		expect(created).toBe(false);
+		await writer.write({ jsonrpc: "2.0", id: createFrame.id, result: { terminalId: "terminal" } });
+		const terminal = await creating;
+		await creationBarrier;
+		const methods = ["terminal/output", "terminal/wait_for_exit", "terminal/kill", "terminal/release"];
+		const requests = [terminal.currentOutput(), terminal.waitForExit(), terminal.kill(), terminal.release()];
+		let settled = false;
+		const barrier = connection.waitForSessionRequests("session").then(() => {
+			settled = true;
+		});
+		for (const method of methods) {
+			const frame = (await reader.read()).value;
+			if (!frame || !("id" in frame)) throw new Error("Expected terminal request");
+			expect(frame).toEqual({
+				jsonrpc: "2.0",
+				id: frame.id,
+				method,
+				params: { sessionId: "session", terminalId: "terminal" },
+			});
+			expect(settled).toBe(false);
+			await writer.write({
+				jsonrpc: "2.0",
+				id: frame.id,
+				result: method === "terminal/output" ? { output: "", truncated: false } : {},
+			});
+		}
+		await Promise.all([...requests, barrier]);
+		expect(settled).toBe(true);
+		await writer.close();
+		await connection.closed;
+		reader.releaseLock();
+		writer.releaseLock();
 	});
 
 	it("matches the SDK error-code fixtures", () => {

@@ -13,6 +13,10 @@
 ### Changed
 
 - `acp` runtime validators (`zNewSessionResponse`, `zSessionNotification`, …) now report each failing field's path and reason in `error.issues` instead of a single `Invalid <label>`; `ValidationError` issue paths are typed `PropertyKey[]` ([#17699](https://github.com/can1357/oh-my-pi/pull/17699))
+### Added
+
+- ACP agent connections expose per-session client-request settlement/cancellation and exact inbound response-write completion barriers.
+
 ### Fixed
 
 - ACP connections drop writes queued after closure and report outbound failures through the connection lifetime and pending requests, preventing unhandled notification rejections during teardown.
