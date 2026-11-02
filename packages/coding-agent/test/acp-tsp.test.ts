@@ -14,6 +14,7 @@ import { ONE_PIXEL_PNG } from "./helpers/skill-image-vision";
 const cliEntry = path.resolve(import.meta.dir, "../src/cli.ts");
 const seedEntry = path.resolve(import.meta.dir, "fixtures/acp-tsp-session.ts");
 const flagExtension = path.resolve(import.meta.dir, "fixtures/acp-tsp-flags.ts");
+const settlementExtension = path.resolve(import.meta.dir, "fixtures/acp-tsp-settlement.ts");
 const timeoutMs = 30_000;
 const cliIsolation = [
 	"--no-extensions",
@@ -84,6 +85,8 @@ class CliProcess {
 	readonly child: ChildProcess;
 	readonly changes = new Changes();
 	readonly messages: RpcMessage[] = [];
+	readonly pendingClientRequests = new Map<unknown, RpcMessage>();
+	readonly pendingAtResponse = new Map<RpcMessage, RpcMessage[]>();
 	stdout = "";
 	stderr = "";
 	#pending = "";
@@ -119,14 +122,20 @@ class CliProcess {
 						this.#pending = this.#pending.slice(end + 1);
 						const message: unknown = JSON.parse(line);
 						if (!isRecord(message) || message.jsonrpc !== "2.0") throw new Error(`Non-RPC stdout: ${line}`);
-						this.messages.push({
+						const parsed: RpcMessage = {
 							jsonrpc: message.jsonrpc,
 							id: message.id,
 							result: isRecord(message.result) ? message.result : undefined,
 							error: message.error,
 							method: typeof message.method === "string" ? message.method : undefined,
 							params: isRecord(message.params) ? message.params : undefined,
-						});
+						};
+						if (parsed.method !== undefined && parsed.id !== undefined) {
+							this.pendingClientRequests.set(parsed.id, parsed);
+						} else if (parsed.method === undefined && parsed.id !== undefined) {
+							this.pendingAtResponse.set(parsed, [...this.pendingClientRequests.values()]);
+						}
+						this.messages.push(parsed);
 					}
 				} catch (error) {
 					this.changes.fail(error instanceof Error ? error : new Error(String(error)));
@@ -151,18 +160,36 @@ class CliProcess {
 		return this.child.stdin;
 	}
 
-	async request(method: string, params: Record<string, unknown>): Promise<RpcMessage> {
+	startRequest(method: string, params: Record<string, unknown>): { id: number; response: Promise<RpcMessage> } {
 		const id = this.#nextId++;
 		this.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-		const response = await this.changes.wait(`${method} response; stderr=${this.stderr}`, () => {
+		const response = this.changes.wait(`${method} response; stderr=${this.stderr}`, () => {
 			const message = this.messages.find(message => message.id === id && message.method === undefined);
 			if (message) return message;
 			if (this.#exit) throw new Error(`CLI exited before ${method}: ${this.stderr}`);
 			return undefined;
 		});
+		// A deliberately held boundary may outlive a failed assertion in its test.
+		void response.catch(() => {});
+		return { id, response };
+	}
+
+	async request(method: string, params: Record<string, unknown>): Promise<RpcMessage> {
+		const response = await this.startRequest(method, params).response;
 		expect(response.error, this.stderr).toBeUndefined();
 		expect(response.result).toBeDefined();
 		return response;
+	}
+
+	respond(request: RpcMessage, response: { result: Record<string, unknown> } | { error: unknown }): void {
+		this.pendingClientRequests.delete(request.id);
+		this.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, ...response })}\n`);
+	}
+
+	assertSettled(response: RpcMessage, sessionId: unknown): void {
+		expect(this.pendingAtResponse.get(response)?.filter(request => request.params?.sessionId === sessionId)).toEqual(
+			[],
+		);
 	}
 
 	async exited(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
@@ -357,6 +384,7 @@ async function seedSession(cwd: string, env: NodeJS.ProcessEnv, imageCount = 1):
 async function initializeAndLoad(proc: CliProcess, cwd: string, sessionId: string): Promise<void> {
 	const initialized = await proc.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
 	expect(initialized.result?.protocolVersion).toBe(1);
+	expect(initialized.result?.agentCapabilities).toMatchObject({ _meta: { "omp/settledResponses": true } });
 	await proc.request("session/load", { cwd, sessionId, mcpServers: [] });
 }
 
@@ -404,6 +432,140 @@ async function connectInheritedSocket(socketPath: string): Promise<Socket> {
 	return socket;
 }
 
+/** The HTTP gates hold actual extension cleanup, not an estimate of how long abort takes. */
+class SettlementFixture {
+	readonly changes = new Changes();
+	readonly events: Array<{ name: string; data: Record<string, unknown> }> = [];
+	readonly gates = new Map<string, PromiseWithResolvers<void>>();
+	readonly server: Bun.Server<undefined>;
+	calls = 0;
+
+	constructor(mode: "tool" | "error", held: string[] = [], toolName = "settlement_process") {
+		for (const name of held) this.gates.set(name, Promise.withResolvers<void>());
+		this.server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			idleTimeout: 0,
+			fetch: async request => {
+				const pathname = new URL(request.url).pathname;
+				if (pathname.startsWith("/fixture/")) {
+					const name = pathname.slice("/fixture/".length);
+					const data: unknown = await request.json();
+					if (!isRecord(data)) return new Response("Invalid fixture event", { status: 400 });
+					this.events.push({ name, data });
+					this.changes.changed();
+					await this.gates.get(name)?.promise;
+					return new Response("released");
+				}
+				this.calls++;
+				if (mode === "error") {
+					return Response.json(
+						{ type: "error", error: { type: "invalid_request_error", message: "settlement-provider-failure" } },
+						{ status: 400 },
+					);
+				}
+				const tool = this.calls === 1;
+				const events = [
+					{
+						type: "message_start",
+						message: {
+							id: `settlement-${this.calls}`,
+							type: "message",
+							role: "assistant",
+							model: "transcript",
+							content: [],
+							stop_reason: null,
+							stop_sequence: null,
+							usage: { input_tokens: 8, output_tokens: 0 },
+						},
+					},
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: tool
+							? { type: "tool_use", id: "settlement-tool", name: toolName, input: {} }
+							: { type: "text", text: "" },
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: tool
+							? {
+									type: "input_json_delta",
+									partial_json: toolName === "bash" ? '{"command":"printf settlement"}' : "{}",
+								}
+							: { type: "text_delta", text: "Settlement completed." },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "message_delta",
+						delta: { stop_reason: tool ? "tool_use" : "end_turn", stop_sequence: null },
+						usage: { output_tokens: 8 },
+					},
+					{ type: "message_stop" },
+				];
+				return new Response(
+					events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+			},
+		});
+	}
+
+	async event(name: string): Promise<Record<string, unknown>> {
+		return this.changes.wait(`extension ${name}`, () => this.events.find(event => event.name === name)?.data);
+	}
+
+	async stop(): Promise<void> {
+		for (const gate of this.gates.values()) gate.resolve();
+		await this.server.stop(true);
+	}
+}
+
+async function settlementCli(
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+	fixture: SettlementFixture,
+): Promise<{ proc: CliProcess; host: SideChannel }> {
+	const modelsFile = path.join(env.PI_CODING_AGENT_DIR!, "models.yml");
+	const models = JSON.parse(await Bun.file(modelsFile).text());
+	models.providers["acp-fixture"].baseUrl = fixture.server.url.href;
+	await Bun.write(modelsFile, JSON.stringify(models));
+	const socketPath = path.join(cwd, "settlement.sock");
+	const listener = await listen(socketPath);
+	const proc = new CliProcess(
+		["acp", "--tsp", socketPath, "-e", settlementExtension, "--tools", "settlement_process,bash"],
+		cwd,
+		{ ...env, OMP_ACP_SETTLEMENT_URL: fixture.server.url.href },
+		undefined,
+		true,
+		cliIsolation.filter(flag => flag !== "--no-tools"),
+	);
+	const host = new SideChannel(await listener.connection, ["blobs", "settle", "adopt", "dock", "viewers", "keys"]);
+	const initialized = await proc.request("initialize", {
+		protocolVersion: 1,
+		clientCapabilities: { elicitation: { form: {} } },
+	});
+	expect(initialized.result?.agentCapabilities).toMatchObject({ _meta: { "omp/settledResponses": true } });
+	return { proc, host };
+}
+
+function assertResponsesHeld(proc: CliProcess, ids: readonly number[]): void {
+	expect(
+		proc.messages.filter(
+			message => message.method === undefined && typeof message.id === "number" && ids.includes(message.id),
+		),
+	).toEqual([]);
+}
+
+function assertNoUpdatesAfter(proc: CliProcess, response: RpcMessage, sessionId: unknown): void {
+	expect(
+		proc.messages
+			.slice(proc.messages.indexOf(response) + 1)
+			.filter(message => message.method === "session/update" && message.params?.sessionId === sessionId),
+	).toEqual([]);
+}
+
 afterEach(async () => {
 	for (const proc of processes) {
 		proc.child.stdin?.destroy();
@@ -425,6 +587,229 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("ACP TSP side channel", () => {
+	for (const method of ["session/new", "session/load"]) {
+		it(`${method} does not answer with an outstanding startup callback on the ACP wire`, async () => {
+			const { cwd, env } = await isolatedEnvironment();
+			const savedId = method === "session/load" ? await seedSession(cwd, env) : undefined;
+			const fixture = new SettlementFixture("tool");
+			try {
+				const { proc, host } = await settlementCli(cwd, { ...env, OMP_ACP_SETTLEMENT_START_ASK: "1" }, fixture);
+				const boundary = proc.startRequest(method, {
+					cwd,
+					mcpServers: [],
+					...(savedId ? { sessionId: savedId } : {}),
+				});
+				const question = await proc.changes.wait("startup elicitation on the real wire", () =>
+					proc.messages.find(message => message.method === "elicitation/create"),
+				);
+				const sessionId = question.params?.sessionId;
+				expect(typeof sessionId).toBe("string");
+				// This independent round trip proves the CLI is dispatching requests;
+				// silence at the boundary is due to the held callback, not startup.
+				await proc.request("session/list", { cwd });
+				assertResponsesHeld(proc, [boundary.id]);
+				expect(proc.messages.some(message => message.method === "$/cancel_request")).toBe(false);
+				proc.respond(question, { result: { action: "accept", content: { value: true } } });
+				const response = await boundary.response;
+				expect(response.error, proc.stderr).toBeUndefined();
+				proc.assertSettled(response, sessionId);
+				if (method === "session/new") expect(response.result?.sessionId).toBe(sessionId);
+				else {
+					expect(sessionId).toBe(savedId);
+					const replay = proc.messages.find(
+						message =>
+							message.method === "session/update" &&
+							isRecord(message.params?.update) &&
+							isRecord(message.params.update.content) &&
+							message.params.update.content.text === "Saved assistant transcript",
+					);
+					expect(replay).toBeDefined();
+					expect(proc.messages.indexOf(replay!)).toBeLessThan(proc.messages.indexOf(response));
+				}
+				await proc.request("session/close", { sessionId });
+				await gracefulShutdown(proc, host);
+			} finally {
+				await fixture.stop();
+			}
+		}, 60_000);
+	}
+
+	it("cancels queued prompts before the active response, but only after process cleanup and callback acknowledgement", async () => {
+		const { cwd, env } = await isolatedEnvironment();
+		const fixture = new SettlementFixture("tool", ["abort-entered", "end-entered"]);
+		try {
+			const { proc, host } = await settlementCli(cwd, { ...env, OMP_ACP_SETTLEMENT_TOOL_ASK: "1" }, fixture);
+			const created = await proc.request("session/new", { cwd, mcpServers: [] });
+			const sessionId = created.result?.sessionId;
+			proc.assertSettled(created, sessionId);
+			await proc.changes.wait("bootstrap before the measured turn", () =>
+				proc.messages.find(
+					message =>
+						isRecord(message.params?.update) &&
+						message.params.update.sessionUpdate === "available_commands_update",
+				),
+			);
+			const active = proc.startRequest("session/prompt", {
+				sessionId,
+				prompt: [{ type: "text", text: "Run the owned settlement process." }],
+			});
+			const ready = await fixture.event("tool-ready");
+			const pid = ready.pid;
+			if (typeof pid !== "number") throw new Error("Fixture did not report its real subprocess PID");
+			const question = await proc.changes.wait("running tool's held callback", () =>
+				proc.messages.find(message => message.method === "elicitation/create"),
+			);
+			await host.waitForNode(node => node.p?.role === "omp.working.stop");
+			const queued = [0, 1].map(index =>
+				proc.startRequest("session/prompt", {
+					sessionId,
+					prompt: [{ type: "text", text: `Queued settlement request ${index}.` }],
+				}),
+			);
+			const ids = [active.id, ...queued.map(request => request.id)];
+			await proc.request("session/list", { cwd });
+			proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } })}\n`);
+			await fixture.event("abort-entered");
+			expect(() => process.kill(pid, 0)).not.toThrow();
+			await host.changes.wait("TSP working row clears before abort cleanup is released", () =>
+				host.find(node => node.p?.role === "omp.working.stop") ? undefined : true,
+			);
+			const cancellation = await proc.changes.wait("callback cancellation request", () =>
+				proc.messages.find(
+					message => message.method === "$/cancel_request" && message.params?.requestId === question.id,
+				),
+			);
+			await proc.request("session/list", { cwd });
+			assertResponsesHeld(proc, ids);
+			fixture.gates.get("abort-entered")!.resolve();
+			await fixture.event("process-reaped");
+			expect(() => process.kill(pid, 0)).toThrow();
+			await fixture.event("end-entered");
+			await proc.request("session/list", { cwd });
+			assertResponsesHeld(proc, ids);
+			fixture.gates.get("end-entered")!.resolve();
+			await fixture.event("end-completed");
+			await proc.request("session/list", { cwd });
+			// A cancellation notification is not its callback's result/error.
+			assertResponsesHeld(proc, ids);
+			proc.respond(question, { error: { code: -32800, message: "Client acknowledged cancellation" } });
+			const responses = await Promise.all([active.response, ...queued.map(request => request.response)]);
+			for (const response of responses) {
+				expect(response.error, proc.stderr).toBeUndefined();
+				expect(response.result?.stopReason).toBe("cancelled");
+				proc.assertSettled(response, sessionId);
+				expect(proc.messages.indexOf(cancellation)).toBeLessThan(proc.messages.indexOf(response));
+			}
+			for (const response of responses.slice(1)) {
+				expect(proc.messages.indexOf(response)).toBeLessThan(proc.messages.indexOf(responses[0]!));
+			}
+			expect(fixture.calls).toBe(1);
+			await proc.request("session/close", { sessionId });
+			for (const response of responses) assertNoUpdatesAfter(proc, response, sessionId);
+			await gracefulShutdown(proc, host);
+		} finally {
+			await fixture.stop();
+		}
+	}, 60_000);
+
+	it("does not answer a cancelled prompt while its permission callback still has no result", async () => {
+		const { cwd, env } = await isolatedEnvironment();
+		const fixture = new SettlementFixture("tool", [], "bash");
+		try {
+			const { proc, host } = await settlementCli(cwd, env, fixture);
+			const created = await proc.request("session/new", { cwd, mcpServers: [] });
+			const sessionId = created.result?.sessionId;
+			await proc.changes.wait("bootstrap before permission cancellation", () =>
+				proc.messages.find(
+					message =>
+						isRecord(message.params?.update) &&
+						message.params.update.sessionUpdate === "available_commands_update",
+				),
+			);
+			const prompt = proc.startRequest("session/prompt", {
+				sessionId,
+				prompt: [{ type: "text", text: "Ask permission for the settlement process." }],
+			});
+			const permission = await proc.changes.wait("held process permission", () =>
+				proc.messages.find(message => message.method === "session/request_permission"),
+			);
+			proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } })}\n`);
+			await proc.changes.wait("permission cancellation reaches the client", () =>
+				proc.messages.find(
+					message => message.method === "$/cancel_request" && message.params?.requestId === permission.id,
+				),
+			);
+			await proc.request("session/list", { cwd });
+			assertResponsesHeld(proc, [prompt.id]);
+			proc.respond(permission, { error: { code: -32800, message: "Permission UI closed" } });
+			await fixture.event("end-completed");
+			const response = await prompt.response;
+			expect(response.error, proc.stderr).toBeUndefined();
+			expect(response.result?.stopReason).toBe("cancelled");
+			proc.assertSettled(response, sessionId);
+			expect(fixture.events.some(event => event.name === "tool-ready")).toBe(false);
+			await proc.request("session/close", { sessionId });
+			assertNoUpdatesAfter(proc, response, sessionId);
+			await gracefulShutdown(proc, host);
+		} finally {
+			await fixture.stop();
+		}
+	}, 60_000);
+
+	it("drains provider-error updates and final extension cleanup before answering the prompt", async () => {
+		const { cwd, env } = await isolatedEnvironment();
+		const fixture = new SettlementFixture("error", ["end-entered"]);
+		try {
+			const { proc, host } = await settlementCli(cwd, { ...env, OMP_ACP_SETTLEMENT_END_ASK: "1" }, fixture);
+			const created = await proc.request("session/new", { cwd, mcpServers: [] });
+			const sessionId = created.result?.sessionId;
+			await proc.changes.wait("bootstrap before provider failure", () =>
+				proc.messages.find(
+					message =>
+						isRecord(message.params?.update) &&
+						message.params.update.sessionUpdate === "available_commands_update",
+				),
+			);
+			const prompt = proc.startRequest("session/prompt", {
+				sessionId,
+				prompt: [{ type: "text", text: "Exercise the provider failure settlement boundary." }],
+			});
+			await fixture.event("end-entered");
+			const question = await proc.changes.wait("error cleanup's held callback", () =>
+				proc.messages.find(message => message.method === "elicitation/create"),
+			);
+			await proc.request("session/list", { cwd });
+			assertResponsesHeld(proc, [prompt.id]);
+			fixture.gates.get("end-entered")!.resolve();
+			await fixture.event("end-completed");
+			// The callback can complete normally despite provider failure, but
+			// cannot remain outstanding when the prompt response is received.
+			await proc.request("session/list", { cwd });
+			assertResponsesHeld(proc, [prompt.id]);
+			proc.respond(question, { result: { action: "accept", content: { value: true } } });
+			const response = await prompt.response;
+			expect(response.error, proc.stderr).toBeUndefined();
+			expect(response.result?.stopReason).toBe("end_turn");
+			proc.assertSettled(response, sessionId);
+			expect(fixture.calls).toBe(1);
+			const failure = proc.messages.find(
+				message =>
+					message.method === "session/update" &&
+					isRecord(message.params?.update) &&
+					isRecord(message.params.update.content) &&
+					typeof message.params.update.content.text === "string" &&
+					message.params.update.content.text.includes("settlement-provider-failure"),
+			);
+			expect(failure).toBeDefined();
+			expect(proc.messages.indexOf(failure!)).toBeLessThan(proc.messages.indexOf(response));
+			await proc.request("session/close", { sessionId });
+			assertNoUpdatesAfter(proc, response, sessionId);
+			await gracefulShutdown(proc, host);
+		} finally {
+			await fixture.stop();
+		}
+	}, 60_000);
+
 	it("negotiates the cockpit over a real CLI side channel while ACP exclusively settles confirm cards", async () => {
 		const { cwd, env } = await isolatedEnvironment();
 		let calls = 0;
@@ -592,9 +977,7 @@ describe.skipIf(process.platform === "win32")("ACP TSP side channel", () => {
 			await host.waitForNode(node => node.k === "elapsed", shared);
 			host.event({ ev: "action", sf: shared, id: card.id, act: "allow", mods: [] });
 			expect(calls).toBe(1);
-			proc.stdin.write(
-				`${JSON.stringify({ jsonrpc: "2.0", id: permission.id, result: { outcome: { outcome: "selected", optionId: "allow_once" } } })}\n`,
-			);
+			proc.respond(permission, { result: { outcome: { outcome: "selected", optionId: "allow_once" } } });
 			await prompt;
 			await host.waitForNode(
 				node =>

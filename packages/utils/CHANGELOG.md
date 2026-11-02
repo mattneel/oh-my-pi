@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- ACP agent connections expose per-session client-request settlement/cancellation and exact inbound response-write completion barriers.
+
 ### Fixed
 
 - ACP connections drop writes queued after closure and report outbound failures through the connection lifetime and pending requests, preventing unhandled notification rejections during teardown.

@@ -552,6 +552,7 @@ async function createHarness(
 		clientCapabilities?: ClientCapabilities;
 		/** Runs before a notification is recorded, so a test can delay one delivery. */
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
+		waitForSessionRequests?: (sessionId: string) => Promise<void>;
 		permissionHandler?: (request: RequestPermissionRequest) => void;
 		/** Gives each session the factory creates a real extension runner with no extensions. */
 		extensionRunners?: boolean;
@@ -577,6 +578,9 @@ async function createHarness(
 	const setToolUIContextSpies: SetToolUIContextSpy[] = [];
 	const sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined> = [];
 	const connection = {
+		waitForSessionRequests: (sessionId: string) => options.waitForSessionRequests?.(sessionId) ?? Promise.resolve(),
+		cancelSessionRequests: () => {},
+		responseWritten: async () => {},
 		sessionUpdate: async (notification: SessionNotification) => {
 			// Only await when a hook is configured: `await undefined` would insert a
 			// microtask before the push and perturb ordering-sensitive tests.
@@ -1045,6 +1049,37 @@ describe("ACP agent", () => {
 				}),
 			},
 		]);
+	});
+
+	it("does not apply cancellation's cleanup timeout to a healthy startup callback", async () => {
+		const waiting = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			waitForSessionRequests: async () => {
+				waiting.resolve();
+				await release.promise;
+			},
+		});
+		harness.agent.setCancelCleanupTimeoutForTesting(1);
+		vi.useFakeTimers();
+		const creating = harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		let answered = false;
+		void creating.then(() => {
+			answered = true;
+		});
+		try {
+			await waiting.promise;
+			vi.advanceTimersByTime(100);
+			await Promise.resolve();
+			expect(answered).toBe(false);
+			expect(harness.sessions.some(session => session.disposed)).toBe(false);
+			release.resolve();
+			await creating;
+			expect(answered).toBe(true);
+		} finally {
+			release.resolve();
+			await harness.agent.dispose();
+		}
 	});
 
 	it("awaits an in-flight bootstrap notification before disposing its session", async () => {
@@ -2639,12 +2674,14 @@ describe("ACP agent", () => {
 			prompt: [{ type: "text", text: "overlap" }],
 		} as PromptRequest);
 
-		// First resolves immediately as cancelled
-		const firstResponse = await firstPrompt;
-		expect(firstResponse.stopReason).toBe("cancelled");
+		let firstReturned = false;
+		void firstPrompt.then(() => {
+			firstReturned = true;
+		});
 
 		// abort() must have been called as part of cancel cleanup
 		await abortStarted.promise;
+		expect(firstReturned).toBe(false);
 
 		// Second prompt must NOT start until abort cleanup completes
 		await Bun.sleep(0);
@@ -2657,6 +2694,7 @@ describe("ACP agent", () => {
 
 		// Unblock both session.prompt calls (first is fire-and-forget, second drives the response)
 		for (const resolve of blockers) resolve();
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		const secondResponse = await secondPrompt;
 		expect(secondResponse.stopReason).toBe("end_turn");
 
@@ -2741,17 +2779,14 @@ describe("ACP agent", () => {
 		}
 		expect(session.promptCalls).toEqual(["long running"]);
 
-		// Cancel the live turn: its wire response settles immediately, but its
-		// cleanup parks behind the blocked first abort.
+		// The live turn's response and the next dispatch both wait for this abort.
 		const firstCancel = harness.agent.cancel({ sessionId: created.sessionId });
 		for (let i = 0; i < 20 && abortCalls === 0; i++) {
 			await Bun.sleep(0);
 		}
 		expect(abortCalls).toBe(1);
 
-		// A second prompt arrives while the first turn is settled but its
-		// cleanup is still in flight: the queue callback parks on
-		// `previousTurn.cleanup` before creating its turn slot.
+		// A second prompt arrives while cleanup is in flight and remains queued.
 		const secondPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
 			messageId: "00000000-0000-4000-8000-000000000049",
@@ -2759,12 +2794,8 @@ describe("ACP agent", () => {
 		} as PromptRequest);
 		await Bun.sleep(0);
 
-		// The user cancels again while the first cleanup is still unwinding
-		// and that second prompt is still inside its dispatch window: the
-		// stop must mark the queued prompt, and it must REUSE the first
-		// cleanup's barrier (the turn is settled but still in flight) rather
-		// than starting a second, uncoalesced abort that could reset a
-		// replacement prompt.
+		// A repeated Stop marks the queued prompt and reuses the active abort
+		// barrier rather than starting a second abort over the replacement.
 		const secondCancel = harness.agent.cancel({ sessionId: created.sessionId });
 		await Bun.sleep(20);
 		expect(abortCalls).toBe(1);
@@ -2878,7 +2909,7 @@ describe("ACP agent", () => {
 		try {
 			const returnedBeforeIdle = await Promise.race([firstPrompt.then(() => true), Bun.sleep(0).then(() => false)]);
 			expect(returnedBeforeIdle).toBe(false);
-			expect(session.waitForIdleCalls).toBe(1);
+			expect(session.waitForIdleCalls).toBe(2);
 
 			unblockIdle();
 			await firstPrompt;
@@ -3041,11 +3072,11 @@ describe("ACP agent", () => {
 		try {
 			const returnedBeforeDelivery = await Promise.race([prompt.then(() => true), Bun.sleep(0).then(() => false)]);
 			expect(returnedBeforeDelivery).toBe(false);
-			expect(session.waitForIdleCalls).toBe(1);
+			expect(session.waitForIdleCalls).toBe(2);
 
 			releaseDelivery();
 			await prompt;
-			expect(session.waitForIdleCalls).toBe(2);
+			expect(session.waitForIdleCalls).toBe(4);
 			expect(drainCalls).toBe(2);
 		} finally {
 			releaseDelivery();
@@ -3084,7 +3115,7 @@ describe("ACP agent", () => {
 		expect(harness.updates.some(notification => JSON.stringify(notification).includes("async continuation"))).toBe(
 			true,
 		);
-		expect(session.waitForIdleCalls).toBe(2);
+		expect(session.waitForIdleCalls).toBe(4);
 		expect(drainCalls).toBe(2);
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -3161,9 +3192,7 @@ describe("ACP agent", () => {
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
 		await abortBlocked.promise;
 		const returnedBeforeCleanup = await Promise.race([firstPrompt.then(() => true), Bun.sleep(0).then(() => false)]);
-		expect(returnedBeforeCleanup).toBe(true);
-		const cancelledResponse = await firstPrompt;
-		expect(cancelledResponse.stopReason).toBe("cancelled");
+		expect(returnedBeforeCleanup).toBe(false);
 
 		for (const listener of session.listeners()) {
 			listener({
@@ -3184,6 +3213,7 @@ describe("ACP agent", () => {
 
 		releaseAbort();
 		await cancelPrompt;
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		finishPrompt();
 		await secondPrompt;
 		expect(session.promptCalls).toEqual(["cancel me", "after cancel"]);
@@ -3302,10 +3332,10 @@ describe("ACP agent", () => {
 		vi.useFakeTimers();
 		try {
 			const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
-			expect((await firstPrompt).stopReason).toBe("cancelled");
 			vi.advanceTimersByTime(5_200);
 			abortRelease.resolve();
 			await cancelPrompt;
+			expect((await firstPrompt).stopReason).toBe("cancelled");
 			expect(session.disposed).toBe(false);
 
 			const secondPrompt = harness.agent.prompt({
@@ -3340,8 +3370,9 @@ describe("ACP agent", () => {
 
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
 		const returnedBeforeTimeout = await Promise.race([firstPrompt.then(() => true), Bun.sleep(0).then(() => false)]);
-		expect(returnedBeforeTimeout).toBe(true);
+		expect(returnedBeforeTimeout).toBe(false);
 		await expect(cancelPrompt).resolves.toBeUndefined();
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		expect(session.disposed).toBe(true);
 		await expect(
 			harness.agent.prompt({
@@ -3372,7 +3403,6 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
-		await firstPrompt;
 		const queuedPrompt = harness.agent
 			.prompt({
 				sessionId: created.sessionId,
@@ -3382,6 +3412,7 @@ describe("ACP agent", () => {
 			.catch(error => error);
 
 		await cancelPrompt;
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		const queuedError = await queuedPrompt;
 		expect(queuedError).toMatchObject({ code: -32002 });
 		expect(session.promptCalls).toEqual(["stuck cancel before queued"]);
@@ -3443,7 +3474,6 @@ describe("ACP agent", () => {
 
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
 		await abortBlocked.promise;
-		await firstPrompt;
 
 		const closePrompt = harness.agent.closeSession({ sessionId: created.sessionId });
 		await Bun.sleep(0);
@@ -3451,6 +3481,7 @@ describe("ACP agent", () => {
 
 		releaseAbort();
 		await cancelPrompt;
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		await closePrompt;
 		expect(session.disposed).toBe(true);
 
@@ -3484,7 +3515,6 @@ describe("ACP agent", () => {
 
 		const cancelPrompt = harness.agent.cancel({ sessionId: created.sessionId });
 		await abortBlocked.promise;
-		await firstPrompt;
 
 		await expect(
 			harness.agent.unstable_forkSession({
@@ -3496,6 +3526,7 @@ describe("ACP agent", () => {
 
 		releaseAbort();
 		await cancelPrompt;
+		expect((await firstPrompt).stopReason).toBe("cancelled");
 		finishPrompt();
 		harness.abortController.abort();
 		await Bun.sleep(0);

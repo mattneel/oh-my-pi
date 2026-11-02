@@ -111,8 +111,24 @@ type Dispatcher = (
 	notification: boolean,
 	/** Abort signal for an inbound *request*: fires when the peer cancels it via `$/cancel_request`. */
 	signal?: AbortSignal,
+	/** Resolves after this inbound request's response write completes. */
+	responseWritten?: Promise<void>,
 ) => MaybePromise<unknown>;
-type Pending = { resolve(value: unknown): void; reject(reason: unknown): void };
+type Pending = {
+	promise: Promise<unknown>;
+	resolve(value: unknown): void;
+	reject(reason: unknown): void;
+	method?: string;
+	sessionId?: string;
+	cancelled?: boolean;
+	cancelWritten?: boolean;
+	responseReceived?: boolean;
+};
+type SessionRequestWaiter = {
+	promise: Promise<void>;
+	resolve(): void;
+	reject(reason: unknown): void;
+};
 
 /** Options for {@link RpcConnection}. */
 export interface RpcConnectionOptions {
@@ -133,6 +149,7 @@ const INBOUND_DRAIN_TIMEOUT_MS = 30_000;
 export class RpcConnection {
 	#nextId = 0;
 	#pending = new Map<JsonRpcId, Pending>();
+	#sessionRequestWaiters = new Map<string, SessionRequestWaiter>();
 	#inbound = new Set<Promise<void>>();
 	#openInboundIds = new Set<JsonRpcId>();
 	/** Abort controller per inbound request, fired by a peer `$/cancel_request` (opt-in). */
@@ -166,11 +183,68 @@ export class RpcConnection {
 	}
 
 	/**
+	 * Waits until this session has no wire-pending outgoing requests.
+	 * Request errors count as settlement. Local cancellation still waits for
+	 * the peer's correlated result/error and the `$/cancel_request` write,
+	 * without changing the already-rejected caller promise. Connection closure
+	 * rejects the barrier; callers own any deadline for an unresponsive peer.
+	 */
+	async waitForSessionRequests(sessionId: string): Promise<void> {
+		while (true) {
+			if (this.signal.aborted) throw this.signal.reason ?? new Error("Connection closed");
+			if (!this.#hasSessionRequests(sessionId)) return;
+			let waiter = this.#sessionRequestWaiters.get(sessionId);
+			if (!waiter) {
+				waiter = Promise.withResolvers<void>();
+				this.#sessionRequestWaiters.set(sessionId, waiter);
+			}
+			await waiter.promise;
+		}
+	}
+
+	/** Cancels this session's local requests while retaining their wire settlement tracking. */
+	cancelSessionRequests(sessionId: string): void {
+		for (const [id, pending] of this.#pending) {
+			if (pending.sessionId === sessionId) this.#cancelRequest(id, pending);
+		}
+	}
+
+	#cancelRequest(id: JsonRpcId, pending: Pending): void {
+		if (pending.cancelled) return;
+		pending.cancelled = true;
+		pending.reject(RequestError.requestCancelled({ requestId: id, method: pending.method }));
+		void this.notify("$/cancel_request", { requestId: id }).then(() => {
+			pending.cancelWritten = true;
+			if (pending.responseReceived) this.#finishRequest(id);
+		});
+	}
+
+	#hasSessionRequests(sessionId: string): boolean {
+		for (const pending of this.#pending.values()) {
+			if (pending.sessionId === sessionId) return true;
+		}
+		return false;
+	}
+
+	#finishRequest(id: JsonRpcId): void {
+		const pending = this.#pending.get(id);
+		if (!pending) return;
+		this.#pending.delete(id);
+		const sessionId = pending.sessionId;
+		if (sessionId === undefined) return;
+		const waiter = this.#sessionRequestWaiters.get(sessionId);
+		if (!waiter || this.#hasSessionRequests(sessionId)) return;
+		this.#sessionRequestWaiters.delete(sessionId);
+		waiter.resolve();
+	}
+
+	/**
 	 * Sends a JSON-RPC request whose pending entry can be cancelled locally:
-	 * `cancel()` rejects the promise with a request-cancelled error, notifies
-	 * the peer via `$/cancel_request`, and drops the pending entry so a late
-	 * response is ignored. Used for agent→client requests a mid-turn event can
-	 * supersede (e.g. a permission elicit cancelled when user steering arrives).
+	 * `cancel()` rejects the promise with a request-cancelled error and notifies
+	 * the peer via `$/cancel_request`. Late responses cannot change the caller's
+	 * rejected promise, but session settlement retains the wire correlation
+	 * until the peer answers and the cancellation write ends. Used for
+	 * agent→client requests a mid-turn event can supersede.
 	 */
 	requestCancellable<Response>(
 		method: string,
@@ -191,9 +265,8 @@ export class RpcConnection {
 			id,
 			promise: deferred.promise as Promise<Response>,
 			cancel: () => {
-				if (!this.#pending.delete(id)) return;
-				deferred.reject(RequestError.requestCancelled({ requestId: id, method }));
-				void this.notify("$/cancel_request", { requestId: id }).catch(() => undefined);
+				const pending = this.#pending.get(id);
+				if (pending) this.#cancelRequest(id, pending);
 			},
 		};
 	}
@@ -204,10 +277,18 @@ export class RpcConnection {
 		params: unknown,
 	): {
 		id: number;
-		deferred: { promise: Promise<unknown>; resolve: (value?: unknown) => void; reject: (reason?: unknown) => void };
+		deferred: Pending;
 	} {
 		const id = this.#nextId++;
-		const deferred = Promise.withResolvers<unknown>();
+		const deferred: Pending = Promise.withResolvers<unknown>();
+		deferred.method = method;
+		if (
+			typeof params === "object" &&
+			params !== null &&
+			"sessionId" in params &&
+			typeof params.sessionId === "string"
+		)
+			deferred.sessionId = params.sessionId;
 		this.#pending.set(id, deferred);
 		void this.#write({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) });
 		return { id, deferred };
@@ -228,6 +309,8 @@ export class RpcConnection {
 		this.#abort.abort(error);
 		for (const pending of this.#pending.values()) pending.reject(error ?? new Error("Connection closed"));
 		this.#pending.clear();
+		for (const waiter of this.#sessionRequestWaiters.values()) waiter.reject(error ?? new Error("Connection closed"));
+		this.#sessionRequestWaiters.clear();
 		this.#closed.resolve();
 	}
 
@@ -301,10 +384,15 @@ export class RpcConnection {
 		if ("id" in message && !("method" in message)) {
 			const pending = this.#pending.get(message.id);
 			if (!pending) return;
-			this.#pending.delete(message.id);
+			if (pending.cancelled) {
+				pending.responseReceived = true;
+				if (pending.cancelWritten) this.#finishRequest(message.id);
+				return;
+			}
 			if ("error" in message)
 				pending.reject(new RequestError(message.error.code, message.error.message, message.error.data));
 			else pending.resolve(message.result);
+			this.#finishRequest(message.id);
 			return;
 		}
 		if (!("method" in message)) return;
@@ -331,8 +419,15 @@ export class RpcConnection {
 		const cancellers = this.#inboundCancellers;
 		const canceller = cancellers ? new AbortController() : undefined;
 		if (canceller) cancellers?.set(message.id, canceller);
+		const responseWritten = Promise.withResolvers<void>();
 		try {
-			const result = await this.#dispatcher(message.method, message.params, false, canceller?.signal);
+			const result = await this.#dispatcher(
+				message.method,
+				message.params,
+				false,
+				canceller?.signal,
+				responseWritten.promise,
+			);
 			await this.#respond(message.id, { result: result ?? {} });
 		} catch (error) {
 			const protocolError =
@@ -342,6 +437,7 @@ export class RpcConnection {
 			await this.#respond(message.id, { error: protocolError.toErrorResponse() });
 		} finally {
 			cancellers?.delete(message.id);
+			responseWritten.resolve();
 		}
 	}
 

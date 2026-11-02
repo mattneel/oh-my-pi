@@ -7,10 +7,12 @@
 - ACP hosts can receive the shared native TSP transcript over an optional duplex side channel with `omp acp --tsp [fd|socket]`, independently of ACP stdio.
 - ACP cockpit hosts can negotiate per-window model/effort pickers and the Agents hub, a shared status/Stop dock, tool approvals and questions while keeping all completions on ACP.
 - ACP cockpit transcripts preserve durable assistant and Yard turn keys across reload/replay, separate explicit Yard context from visible messages, and retain complete folded tool content.
+- ACP advertises `omp/settledResponses`: session startup and all prompt responses wait for cleanup, turn updates and client callback results, allowing safe live-connection handoff.
 
 ### Fixed
 
 - ACP session teardown cancels pending bootstrap notifications and awaits in-flight delivery before releasing the session, preventing late updates from racing closed client streams.
+- Cancelled and failed ACP prompts no longer answer before their session settles; queued cancellations answer before the active response while TSP Stop remains immediate.
 
 ## [18.15.0] - 2026-11-01
 

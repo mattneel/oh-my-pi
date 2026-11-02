@@ -342,6 +342,11 @@ export class AcpCockpit implements Component {
 		}
 	}
 
+	cancel(): void {
+		this.#working = undefined;
+		this.#status.markActivityEnd();
+	}
+
 	viewerLeft(viewer: string): void {
 		const host = this.#viewers.get(viewer);
 		if (!host) return;
