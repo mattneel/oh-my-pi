@@ -265,8 +265,10 @@ ACP `initialize` advertises
 boundaries: cleanup has completed, the turn's updates have been written, and
 no agent-to-client request for that session is still awaiting its result or
 error. This includes failed and cancelled prompts. A cancellation notification
-alone is not a callback result; the client must answer its cancelled request
-(normally with JSON-RPC error `-32800`).
+alone is not a callback result; the client must answer its cancelled request.
+For `session/request_permission`, return the ACP result
+`{"outcome":{"outcome":"cancelled"}}`; it may arrive before or after
+`session/cancel`. JSON-RPC error `-32800` also acknowledges cancellation.
 
 Stop still dismisses the TSP working row immediately. Its ACP prompt response
 waits for the existing bounded cleanup barrier, and prompts cancelled while

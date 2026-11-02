@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Native TSP presentation supports dedicated duplex connections and live transcript updates without an interactive terminal.
+- Added negotiated viewer-scoped native surfaces and key routing, tool approval projections and question forms for ACP cockpits.
+- Transcript builders can opt into durable wire keys, explicit Yard context sections and complete tool bodies independent of local folds.
+- The Git app accepts a portable rendering/lifetime host, allowing viewer-scoped native pages without constructing an interactive terminal.
+- Native viewer command events have correlated success/refusal replies; full Models, settings, agents and auth screens accept narrow hosts with viewer-owned cancellation.
+
+### Fixed
+
+- Dedicated TSP sockets drain late frame acknowledgements during graceful shutdown instead of resetting the host connection.
+
 ## [18.16.0] - 2026-11-02
 
 ### Breaking Changes
@@ -36,17 +48,6 @@
 - With two or more `Editor.predictions`, the ghost text follows the first one the draft is a prefix of; a typed draft that equals a shorter one keeps the ghost of a longer one. Once the buffer equals one of them with no ghost (always right after Tab, Right, or the list inserts one), a dim `⇥ N more` hint appears; press Tab to list them all, then Enter, Tab or Right to swap the whole line (never submitting) or Esc to keep it ([#17796](https://github.com/can1357/oh-my-pi/pull/17796) by [@wolfiesch](https://github.com/wolfiesch))
 - F2 now opens the rename dialog in the resume picker in Ghostty, kitty and other terminals using the kitty keyboard protocol; F1 and F4 shortcuts work there too ([#17812](https://github.com/can1357/oh-my-pi/issues/17812)).
 - Added `Component.nativeTrailers()`, which lets a transcript block add native blocks of its own directly after it. Trailing blocks stay visible while the block is collapsed.
-### Added
-
-- Native TSP presentation supports dedicated duplex connections and live transcript updates without an interactive terminal.
-- Added negotiated viewer-scoped native surfaces and key routing, tool approval projections and question forms for ACP cockpits.
-- Transcript builders can opt into durable wire keys, explicit Yard context sections and complete tool bodies independent of local folds.
-- The Git app accepts a portable rendering/lifetime host, allowing viewer-scoped native pages without constructing an interactive terminal.
-- Native viewer command events have correlated success/refusal replies; full Models, settings, agents and auth screens accept narrow hosts with viewer-owned cancellation.
-
-### Fixed
-
-- Dedicated TSP sockets drain late frame acknowledgements during graceful shutdown instead of resetting the host connection.
 
 ## [18.15.0] - 2026-11-01
 

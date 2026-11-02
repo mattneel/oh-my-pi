@@ -9,8 +9,8 @@
 
 import { Loader, type LoaderUI } from "../components/loader";
 import { Text } from "../components/text";
-import { Container, type TUI } from "../tui";
-import { getSymbolTheme, theme } from "../theme/theme";
+import { Container } from "../tui";
+import { theme } from "../theme/theme";
 import type { OutputArtifactError } from "../tools/streaming-output";
 import {
 	formatArtifactErrorNotice,

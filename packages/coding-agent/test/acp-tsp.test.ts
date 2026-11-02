@@ -740,49 +740,65 @@ describe.skipIf(process.platform === "win32")("ACP TSP side channel", () => {
 		}
 	}, 60_000);
 
-	it("does not answer a cancelled prompt while its permission callback still has no result", async () => {
-		const { cwd, env } = await isolatedEnvironment();
-		const fixture = new SettlementFixture("tool", [], "bash");
-		try {
-			const { proc, host } = await settlementCli(cwd, env, fixture);
-			const created = await proc.request("session/new", { cwd, mcpServers: [] });
-			const sessionId = created.result?.sessionId;
-			await proc.changes.wait("bootstrap before permission cancellation", () =>
-				proc.messages.find(
-					message =>
-						isRecord(message.params?.update) &&
-						message.params.update.sessionUpdate === "available_commands_update",
-				),
-			);
-			const prompt = proc.startRequest("session/prompt", {
-				sessionId,
-				prompt: [{ type: "text", text: "Ask permission for the settlement process." }],
-			});
-			const permission = await proc.changes.wait("held process permission", () =>
-				proc.messages.find(message => message.method === "session/request_permission"),
-			);
-			proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } })}\n`);
-			await proc.changes.wait("permission cancellation reaches the client", () =>
-				proc.messages.find(
-					message => message.method === "$/cancel_request" && message.params?.requestId === permission.id,
-				),
-			);
-			await proc.request("session/list", { cwd });
-			assertResponsesHeld(proc, [prompt.id]);
-			proc.respond(permission, { error: { code: -32800, message: "Permission UI closed" } });
-			await fixture.event("end-completed");
-			const response = await prompt.response;
-			expect(response.error, proc.stderr).toBeUndefined();
-			expect(response.result?.stopReason).toBe("cancelled");
-			proc.assertSettled(response, sessionId);
-			expect(fixture.events.some(event => event.name === "tool-ready")).toBe(false);
-			await proc.request("session/close", { sessionId });
-			assertNoUpdatesAfter(proc, response, sessionId);
-			await gracefulShutdown(proc, host);
-		} finally {
-			await fixture.stop();
-		}
-	}, 60_000);
+	it.each(["rpc-error-after-cancel", "cancelled-after-cancel", "cancelled-before-cancel"] as const)(
+		"settles the prompt only after the permission callback result (%s)",
+		async order => {
+			const { cwd, env } = await isolatedEnvironment();
+			const fixture = new SettlementFixture("tool", [], "bash");
+			try {
+				const { proc, host } = await settlementCli(cwd, env, fixture);
+				const created = await proc.request("session/new", { cwd, mcpServers: [] });
+				const sessionId = created.result?.sessionId;
+				await proc.changes.wait("bootstrap before permission cancellation", () =>
+					proc.messages.find(
+						message =>
+							isRecord(message.params?.update) &&
+							message.params.update.sessionUpdate === "available_commands_update",
+					),
+				);
+				const prompt = proc.startRequest("session/prompt", {
+					sessionId,
+					prompt: [{ type: "text", text: "Ask permission for the settlement process." }],
+				});
+				const permission = await proc.changes.wait("held process permission", () =>
+					proc.messages.find(message => message.method === "session/request_permission"),
+				);
+				if (order === "cancelled-before-cancel") {
+					proc.respond(permission, { result: { outcome: { outcome: "cancelled" } } });
+				}
+				proc.stdin.write(
+					`${JSON.stringify({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } })}\n`,
+				);
+				if (order !== "cancelled-before-cancel") {
+					await proc.changes.wait("permission cancellation reaches the client", () =>
+						proc.messages.find(
+							message => message.method === "$/cancel_request" && message.params?.requestId === permission.id,
+						),
+					);
+					await proc.request("session/list", { cwd });
+					assertResponsesHeld(proc, [prompt.id]);
+					proc.respond(
+						permission,
+						order === "rpc-error-after-cancel"
+							? { error: { code: -32800, message: "Permission UI closed" } }
+							: { result: { outcome: { outcome: "cancelled" } } },
+					);
+				}
+				await fixture.event("end-completed");
+				const response = await prompt.response;
+				expect(response.error, proc.stderr).toBeUndefined();
+				expect(response.result?.stopReason).toBe("cancelled");
+				proc.assertSettled(response, sessionId);
+				expect(fixture.events.some(event => event.name === "tool-ready")).toBe(false);
+				await proc.request("session/close", { sessionId });
+				assertNoUpdatesAfter(proc, response, sessionId);
+				await gracefulShutdown(proc, host);
+			} finally {
+				await fixture.stop();
+			}
+		},
+		60_000,
+	);
 
 	it("drains provider-error updates and final extension cleanup before answering the prompt", async () => {
 		const { cwd, env } = await isolatedEnvironment();

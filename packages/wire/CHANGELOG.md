@@ -2,15 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in `viewers` and `keys` negotiation, viewer audiences and input events, object-valued actions, tool approval props and the `questions` kind for multiplayer ACP cockpits.
+- Added viewer-local `command` events and correlated asynchronous `command` replies for advertised native screen commands.
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
 
 - Added the collab envelope helpers `packEnvelope`, `unpackEnvelope` and `rewriteEnvelopePeer`
-### Added
-
-- Added opt-in `viewers` and `keys` negotiation, viewer audiences and input events, object-valued actions, tool approval props and the `questions` kind for multiplayer ACP cockpits.
-- Added viewer-local `command` events and correlated asynchronous `command` replies for advertised native screen commands.
 
 ## [18.14.2] - 2026-10-31
 

@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- ACP hosts can receive the shared native TSP transcript over an optional duplex side channel with `omp acp --tsp [fd|socket]`, independently of ACP stdio.
+- ACP cockpit hosts can negotiate per-window model/effort pickers and the Agents hub, a shared status/Stop dock, tool approvals and questions while keeping all completions on ACP.
+- ACP cockpit transcripts preserve durable assistant and Yard turn keys across reload/replay, separate explicit Yard context from visible messages, and retain complete folded tool content.
+- ACP advertises `omp/settledResponses`: session startup and all prompt responses wait for cleanup, turn updates and client callback results, allowing safe live-connection handoff.
+- ACP cockpit context, cost and Git status actions open their real native Context, Usage and Git pages independently per viewer, with Close/Escape controls and session-scoped data.
+- ACP viewer screen commands advertise `omp/screen` metadata and open the full Models screen, portable settings/auth/configuration hubs and reports without turning window-local commands into prompts.
+
+### Fixed
+
+- ACP session teardown cancels pending bootstrap notifications and awaits in-flight delivery before releasing the session, preventing late updates from racing closed client streams.
+- Cancelled and failed ACP prompts no longer answer before their session settles; queued cancellations answer before the active response while TSP Stop remains immediate.
+- ACP permission cancellation settles with `stopReason: "cancelled"` whether the client's cancelled outcome arrives before or after `session/cancel`.
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
@@ -45,19 +60,6 @@
 - `models.yml` accepts `tokenizer: cl100k` on a custom model or override ([#17607](https://github.com/can1357/oh-my-pi/pull/17607) by [@will-bogusz](https://github.com/will-bogusz))
 - Claude no longer receives the reasoning kept in a snapcompact archive whose summary an extension wrote without the reasoning legend, with or without image input, and reads that summary's own words instead of a generic one ([#17745](https://github.com/can1357/oh-my-pi/pull/17745) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed `~/.omp/agent/agent.db` getting corrupted (wiping stored logins) on Linux when grep, `read`, the bash tool, extensions or eval read it while omp has it open; `write` and `tts` now refuse to overwrite a database omp holds open ([#15586](https://github.com/can1357/oh-my-pi/issues/15586))
-### Added
-
-- ACP hosts can receive the shared native TSP transcript over an optional duplex side channel with `omp acp --tsp [fd|socket]`, independently of ACP stdio.
-- ACP cockpit hosts can negotiate per-window model/effort pickers and the Agents hub, a shared status/Stop dock, tool approvals and questions while keeping all completions on ACP.
-- ACP cockpit transcripts preserve durable assistant and Yard turn keys across reload/replay, separate explicit Yard context from visible messages, and retain complete folded tool content.
-- ACP advertises `omp/settledResponses`: session startup and all prompt responses wait for cleanup, turn updates and client callback results, allowing safe live-connection handoff.
-- ACP cockpit context, cost and Git status actions open their real native Context, Usage and Git pages independently per viewer, with Close/Escape controls and session-scoped data.
-- ACP viewer screen commands advertise `omp/screen` metadata and open the full Models screen, portable settings/auth/configuration hubs and reports without turning window-local commands into prompts.
-
-### Fixed
-
-- ACP session teardown cancels pending bootstrap notifications and awaits in-flight delivery before releasing the session, preventing late updates from racing closed client streams.
-- Cancelled and failed ACP prompts no longer answer before their session settles; queued cancellations answer before the active response while TSP Stop remains immediate.
 
 ## [18.15.0] - 2026-11-01
 
